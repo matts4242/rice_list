@@ -1,0 +1,22 @@
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p><strong><%= site.name %></strong> — free classifieds. No accounts, no fees.</p>
+    <nav>
+      <a href="/">Browse</a>
+      <a href="/post">Post an ad</a>
+      <% if (isAdmin) { %>
+        <a href="/admin">Moderation</a>
+        <form method="post" action="/admin/logout" class="inline-form">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+          <button type="submit" class="linklike">Sign out</button>
+        </form>
+      <% } else { %>
+        <a href="/admin/login">Moderator</a>
+      <% } %>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

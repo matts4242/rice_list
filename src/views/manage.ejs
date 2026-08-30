@@ -1,0 +1,110 @@
+<%
+  // On a failed edit the submitted values win; otherwise seed from the record.
+  const formValues = values || {
+    title: listing.title,
+    description: listing.description,
+    location: listing.location,
+    category: listing.category_slug,
+    contactEmail: listing.contact_email,
+    contactPhone: listing.contact_phone,
+    showPhone: Boolean(listing.show_phone),
+    priceRaw: listing.price_cents === null ? '' : (listing.price_cents / 100).toFixed(2),
+  };
+%>
+<%- include('partials/head') %>
+
+<div class="form-page">
+  <h1>Manage your ad</h1>
+  <p class="lede">
+    <a href="/listing/<%= listing.public_id %>"><%= listing.title %></a> ·
+    <span class="badge badge-<%= listing.status %>"><%= listing.status %></span> ·
+    expires <%= format.formatDate(listing.expires_at) %>
+  </p>
+
+  <% if (listing.status === 'expired') { %>
+    <div class="flash flash-warning">
+      This ad has expired and is hidden from the site. Renew it to bring it back.
+    </div>
+  <% } else if (listing.status === 'removed') { %>
+    <div class="flash flash-error">
+      This ad was removed by a moderator<% if (listing.removed_reason) { %>:
+      <%= listing.removed_reason %><% } %>.
+    </div>
+  <% } %>
+
+  <section class="panel">
+    <h2>Messages from buyers (<%= inbox.length %>)</h2>
+    <% if (inbox.length === 0) { %>
+      <p class="hint">No messages yet. They will appear here as buyers get in touch.</p>
+    <% } else { %>
+      <ul class="inbox">
+        <% inbox.forEach(function (message) { %>
+          <li class="inbox-item">
+            <p class="inbox-from">
+              <strong><%= message.sender_name %></strong>
+              <a href="mailto:<%= message.sender_email %>"><%= message.sender_email %></a>
+              <span class="inbox-time"><%= format.timeAgo(message.created_at) %></span>
+            </p>
+            <div class="prose"><%- format.paragraphs(message.body) %></div>
+            <% if (!message.relayed) { %>
+              <p class="hint">Not delivered by email — reply from here instead.</p>
+            <% } %>
+          </li>
+        <% }); %>
+      </ul>
+    <% } %>
+  </section>
+
+  <section class="panel">
+    <h2>Edit your ad</h2>
+    <% if (Object.keys(errors).length > 0) { %>
+      <div class="flash flash-error">Please fix the highlighted fields below.</div>
+    <% } %>
+
+    <form method="post" action="/listing/<%= listing.public_id %>/manage"
+          enctype="multipart/form-data" class="stack" novalidate>
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+      <input type="hidden" name="token" value="<%= manageToken %>">
+
+      <%- include('partials/listing-form', { values: formValues, errors: errors, categories: categories, limits: limits }) %>
+
+      <div class="field">
+        <label for="images">Replace photos <span class="hint">(optional)</span></label>
+        <% if (listing.images.length > 0) { %>
+          <div class="thumb-row">
+            <% listing.images.forEach(function (image) { %>
+              <img src="/uploads/<%= thumbFor(image) %>" alt="" width="120" height="90">
+            <% }); %>
+          </div>
+        <% } %>
+        <input id="images" name="images" type="file" accept="image/*" multiple>
+        <p class="hint">Uploading new photos replaces all existing ones.</p>
+        <% if (errors.images) { %><p class="field-error"><%= errors.images %></p><% } %>
+      </div>
+
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit">Save changes</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel panel-danger">
+    <h2>Other actions</h2>
+    <div class="action-row">
+      <form method="post" action="/listing/<%= listing.public_id %>/renew" class="inline-form">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="token" value="<%= manageToken %>">
+        <button class="btn btn-ghost" type="submit">Renew for another period</button>
+      </form>
+
+      <form method="post" action="/listing/<%= listing.public_id %>/delete" class="inline-form"
+            onsubmit="return confirm('Delete this ad permanently? This cannot be undone.');">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="token" value="<%= manageToken %>">
+        <button class="btn btn-danger" type="submit">Delete this ad</button>
+      </form>
+    </div>
+  </section>
+</div>
+
+<%- include('partials/foot') %>

@@ -1,0 +1,106 @@
+<%- include('../partials/head') %>
+
+<div class="admin">
+  <header class="admin-head">
+    <h1>Moderation</h1>
+    <form class="search" action="/admin" method="get" role="search">
+      <input type="hidden" name="filter" value="<%= filterKey %>">
+      <label class="sr-only" for="admin-q">Search listings</label>
+      <input id="admin-q" type="search" name="q" placeholder="Title, email or listing ID"
+             value="<%= search %>">
+      <button type="submit">Search</button>
+    </form>
+  </header>
+
+  <dl class="stat-row">
+    <div class="stat"><dt>Open reports</dt><dd><%= stats.openFlags %></dd></div>
+    <div class="stat"><dt>Active</dt><dd><%= stats.active %></dd></div>
+    <div class="stat"><dt>Removed</dt><dd><%= stats.removed %></dd></div>
+    <div class="stat"><dt>Expired</dt><dd><%= stats.expired %></dd></div>
+    <div class="stat"><dt>Messages</dt><dd><%= stats.messages %></dd></div>
+  </dl>
+
+  <nav class="tabs">
+    <% Object.keys(filters).forEach(function (key) { %>
+      <a class="tab <%= filterKey === key ? 'is-current' : '' %>"
+         href="/admin?filter=<%= key %><%= search ? '&q=' + encodeURIComponent(search) : '' %>">
+        <%= filters[key].label %>
+      </a>
+    <% }); %>
+  </nav>
+
+  <% if (rows.length === 0) { %>
+    <div class="empty"><p class="empty-title">Nothing to review here.</p></div>
+  <% } else { %>
+    <div class="table-scroll">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Listing</th>
+            <th>Status</th>
+            <th>Reports</th>
+            <th>Activity</th>
+            <th>Posted</th>
+            <th><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <% rows.forEach(function (row) { %>
+            <tr>
+              <td>
+                <a class="table-title" href="/admin/listing/<%= row.public_id %>"><%= row.title %></a>
+                <p class="table-sub">
+                  <%= row.category_name %> ·
+                  <%= format.formatPrice(row.price_cents) %> ·
+                  <%= row.contact_email %>
+                </p>
+              </td>
+              <td><span class="badge badge-<%= row.status %>"><%= row.status %></span></td>
+              <td>
+                <% if (row.open_flags > 0) { %>
+                  <span class="badge badge-alert"><%= row.open_flags %> open</span>
+                <% } else { %>
+                  <span class="muted"><%= row.flag_count %></span>
+                <% } %>
+              </td>
+              <td class="muted"><%= row.view_count %> views · <%= row.message_count %> msgs</td>
+              <td class="muted"><%= format.timeAgo(row.created_at) %></td>
+              <td class="table-actions">
+                <% if (row.status === 'active') { %>
+                  <form method="post" action="/admin/listing/<%= row.public_id %>/remove" class="inline-form">
+                    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                    <button class="btn btn-small btn-danger" type="submit">Remove</button>
+                  </form>
+                <% } else { %>
+                  <form method="post" action="/admin/listing/<%= row.public_id %>/restore" class="inline-form">
+                    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                    <button class="btn btn-small btn-ghost" type="submit">Restore</button>
+                  </form>
+                <% } %>
+                <a class="btn btn-small btn-ghost" href="/admin/listing/<%= row.public_id %>">Review</a>
+              </td>
+            </tr>
+          <% }); %>
+        </tbody>
+      </table>
+    </div>
+
+    <% if (pageCount > 1) { %>
+      <nav class="pagination" aria-label="Pagination">
+        <%
+          const adminLink = function (n) {
+            const params = new URLSearchParams({ filter: filterKey });
+            if (search) params.set('q', search);
+            if (n > 1) params.set('page', n);
+            return '/admin?' + params.toString();
+          };
+        %>
+        <% if (page > 1) { %><a class="btn btn-ghost" href="<%= adminLink(page - 1) %>">← Previous</a><% } %>
+        <span class="pagination-status">Page <%= page %> of <%= pageCount %></span>
+        <% if (page < pageCount) { %><a class="btn btn-ghost" href="<%= adminLink(page + 1) %>">Next →</a><% } %>
+      </nav>
+    <% } %>
+  <% } %>
+</div>
+
+<%- include('../partials/foot') %>

@@ -1,0 +1,120 @@
+<%- include('../partials/head') %>
+
+<div class="form-page">
+  <nav class="breadcrumb"><a href="/admin">← Moderation</a></nav>
+
+  <h1><%= listing.title %></h1>
+  <p class="lede">
+    <span class="badge badge-<%= listing.status %>"><%= listing.status %></span> ·
+    <%= format.formatPrice(listing.price_cents) %> ·
+    <%= listing.category_name %>
+    <% if (listing.location) { %> · <%= listing.location %><% } %>
+  </p>
+
+  <% if (listing.status !== 'active' && listing.removed_reason) { %>
+    <div class="flash flash-warning">
+      Currently <strong><%= listing.status %></strong>: <%= listing.removed_reason %>
+    </div>
+  <% } %>
+
+  <section class="panel">
+    <h2>Listing</h2>
+    <dl class="detail-list">
+      <div><dt>Public ID</dt><dd><code><%= listing.public_id %></code></dd></div>
+      <div><dt>Contact email</dt><dd><%= listing.contact_email %></dd></div>
+      <div><dt>Phone</dt><dd><%= listing.contact_phone || '—' %><%= listing.show_phone ? ' (public)' : '' %></dd></div>
+      <div><dt>Posted</dt><dd><%= format.formatDate(listing.created_at) %></dd></div>
+      <div><dt>Expires</dt><dd><%= format.formatDate(listing.expires_at) %></dd></div>
+      <div><dt>Views</dt><dd><%= listing.view_count %></dd></div>
+      <div><dt>Total reports</dt><dd><%= listing.flag_count %></dd></div>
+    </dl>
+
+    <% if (listing.images.length > 0) { %>
+      <div class="thumb-row">
+        <% listing.images.forEach(function (image) { %>
+          <a href="/uploads/<%= image %>"><img src="/uploads/<%= thumbFor(image) %>" alt="" width="120" height="90"></a>
+        <% }); %>
+      </div>
+    <% } %>
+
+    <div class="prose"><%- format.paragraphs(listing.description) %></div>
+    <p><a href="/listing/<%= listing.public_id %>">View public page →</a></p>
+  </section>
+
+  <section class="panel">
+    <h2>Reports (<%= reports.length %>)</h2>
+    <% if (reports.length === 0) { %>
+      <p class="hint">No one has reported this listing.</p>
+    <% } else { %>
+      <ul class="inbox">
+        <% reports.forEach(function (report) { %>
+          <li class="inbox-item">
+            <p class="inbox-from">
+              <strong><%= flagLabel(report.reason) %></strong>
+              <span class="inbox-time"><%= format.timeAgo(report.created_at) %></span>
+              <% if (report.resolved) { %><span class="badge">resolved</span><% } %>
+            </p>
+            <% if (report.note) { %><div class="prose"><%- format.paragraphs(report.note) %></div><% } %>
+          </li>
+        <% }); %>
+      </ul>
+    <% } %>
+  </section>
+
+  <section class="panel">
+    <h2>Messages (<%= inbox.length %>)</h2>
+    <% if (inbox.length === 0) { %>
+      <p class="hint">No buyer messages.</p>
+    <% } else { %>
+      <ul class="inbox">
+        <% inbox.forEach(function (message) { %>
+          <li class="inbox-item">
+            <p class="inbox-from">
+              <strong><%= message.sender_name %></strong> <%= message.sender_email %>
+              <span class="inbox-time"><%= format.timeAgo(message.created_at) %></span>
+            </p>
+            <div class="prose"><%- format.paragraphs(message.body) %></div>
+          </li>
+        <% }); %>
+      </ul>
+    <% } %>
+  </section>
+
+  <section class="panel panel-danger">
+    <h2>Moderation actions</h2>
+
+    <% if (listing.status === 'active') { %>
+      <form method="post" action="/admin/listing/<%= listing.public_id %>/remove" class="stack">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="return_to" value="listing">
+        <div class="field">
+          <label for="reason">Reason shown in the moderation log</label>
+          <input id="reason" name="reason" placeholder="e.g. Prohibited item">
+        </div>
+        <div><button class="btn btn-danger" type="submit">Remove listing</button></div>
+      </form>
+    <% } else { %>
+      <form method="post" action="/admin/listing/<%= listing.public_id %>/restore" class="inline-form">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="return_to" value="listing">
+        <button class="btn btn-primary" type="submit">Restore listing</button>
+      </form>
+    <% } %>
+
+    <div class="action-row">
+      <form method="post" action="/admin/listing/<%= listing.public_id %>/dismiss-reports" class="inline-form">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="return_to" value="listing">
+        <button class="btn btn-ghost" type="submit">Dismiss open reports</button>
+      </form>
+
+      <form method="post" action="/admin/listing/<%= listing.public_id %>/delete" class="inline-form"
+            onsubmit="return confirm('Permanently delete this listing and its images?');">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <button class="btn btn-danger" type="submit">Delete permanently</button>
+      </form>
+    </div>
+  </section>
+</div>
+
+<%- include('../partials/foot') %>

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><%= title %> · <%= site.name %></title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍚</text></svg>">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="/"><span class="brand-mark">🍚</span> <%= site.name %></a>
+
+    <form class="search" action="/" method="get" role="search">
+      <label class="sr-only" for="q">Search listings</label>
+      <input id="q" type="search" name="q" placeholder="Search listings…"
+             value="<%= typeof search !== 'undefined' && search ? search : '' %>">
+      <% if (typeof categorySlug !== 'undefined' && categorySlug) { %>
+        <input type="hidden" name="category" value="<%= categorySlug %>">
+      <% } %>
+      <button type="submit">Search</button>
+    </form>
+
+    <nav class="header-actions">
+      <% if (isAdmin) { %>
+        <a class="btn btn-ghost" href="/admin">Moderation</a>
+      <% } %>
+      <a class="btn btn-primary" href="/post">Post an ad</a>
+    </nav>
+  </div>
+</header>
+
+<% if (flash) { %>
+  <div class="wrap"><div class="flash flash-<%= flash.type %>"><%= flash.message %></div></div>
+<% } %>
+
+<main id="main" class="wrap">
