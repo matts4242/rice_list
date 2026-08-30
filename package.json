@@ -1,0 +1,33 @@
+{
+  "name": "rice-list",
+  "version": "0.1.0",
+  "description": "Rice List — a free, self-hostable classified ads website.",
+  "license": "GPL-3.0-or-later",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node src/scripts/seed.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "better-sqlite3-session-store": "^0.1.0",
+    "dotenv": "^16.4.5",
+    "ejs": "^3.1.10",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.4.1",
+    "express-session": "^1.18.1",
+    "helmet": "^8.0.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^9.0.6",
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0"
+  }
+}

@@ -1,0 +1,32 @@
+<%- include('partials/head') %>
+
+<div class="form-page">
+  <h1>Your ad is live 🎉</h1>
+  <p class="lede"><a href="/listing/<%= listing.public_id %>"><%= listing.title %></a></p>
+
+  <section class="panel">
+    <h2>Save your private management link</h2>
+    <p>
+      This link is the only way to edit or delete your ad, and to read messages
+      from buyers. Keep it somewhere safe — anyone with it can change your ad.
+    </p>
+    <p class="token-box">
+      <code><%= site.url %>/listing/<%= listing.public_id %>/manage?token=<%= manageToken %></code>
+    </p>
+    <% if (emailed) { %>
+      <p class="hint">We also emailed this link to <%= listing.contact_email %>.</p>
+    <% } else { %>
+      <p class="hint">
+        Email delivery is not configured on this site, so this page is the only
+        place the link is shown. Copy it now.
+      </p>
+    <% } %>
+    <p>
+      <a class="btn btn-primary"
+         href="/listing/<%= listing.public_id %>/manage?token=<%= manageToken %>">Manage this ad</a>
+      <a class="btn btn-ghost" href="/listing/<%= listing.public_id %>">View it</a>
+    </p>
+  </section>
+</div>
+
+<%- include('partials/foot') %>

@@ -1,0 +1,75 @@
+<%- include('partials/head') %>
+
+<div class="browse">
+  <aside class="sidebar">
+    <h2 class="sidebar-title">Categories</h2>
+    <ul class="category-list">
+      <li>
+        <a class="<%= categorySlug ? '' : 'is-current' %>"
+           href="/<%= search ? '?q=' + encodeURIComponent(search) : '' %>">All categories</a>
+      </li>
+      <% categories.forEach(function (category) { %>
+        <li>
+          <a class="<%= categorySlug === category.slug ? 'is-current' : '' %>"
+             href="/?category=<%= category.slug %><%= search ? '&q=' + encodeURIComponent(search) : '' %>">
+            <%= category.name %>
+          </a>
+        </li>
+      <% }); %>
+    </ul>
+  </aside>
+
+  <section class="results">
+    <div class="results-head">
+      <h1><%= title %></h1>
+      <p class="results-count">
+        <%= total %> <%= total === 1 ? 'listing' : 'listings' %><% if (search) { %>
+          matching “<%= search %>”<% } %>
+      </p>
+    </div>
+
+    <% if (listings.length === 0) { %>
+      <div class="empty">
+        <p class="empty-title">Nothing here yet.</p>
+        <p>
+          <% if (search) { %>
+            No listings matched that search. Try fewer words, or
+            <a href="/">browse everything</a>.
+          <% } else { %>
+            Be the first — <a href="/post">post an ad</a>.
+          <% } %>
+        </p>
+      </div>
+    <% } else { %>
+      <div class="grid">
+        <% listings.forEach(function (listing) { %>
+          <%- include('partials/listing-card', { listing: listing, thumbFor: thumbFor, format: format }) %>
+        <% }); %>
+      </div>
+
+      <% if (pageCount > 1) { %>
+        <nav class="pagination" aria-label="Pagination">
+          <%
+            const pageLink = function (n) {
+              const params = new URLSearchParams();
+              if (search) params.set('q', search);
+              if (categorySlug) params.set('category', categorySlug);
+              if (n > 1) params.set('page', n);
+              const qs = params.toString();
+              return qs ? '/?' + qs : '/';
+            };
+          %>
+          <% if (page > 1) { %>
+            <a class="btn btn-ghost" href="<%= pageLink(page - 1) %>">← Previous</a>
+          <% } %>
+          <span class="pagination-status">Page <%= page %> of <%= pageCount %></span>
+          <% if (page < pageCount) { %>
+            <a class="btn btn-ghost" href="<%= pageLink(page + 1) %>">Next →</a>
+          <% } %>
+        </nav>
+      <% } %>
+    <% } %>
+  </section>
+</div>
+
+<%- include('partials/foot') %>

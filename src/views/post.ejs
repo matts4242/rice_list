@@ -1,0 +1,36 @@
+<%- include('partials/head') %>
+
+<div class="form-page">
+  <h1>Post an ad</h1>
+  <p class="lede">
+    Free to post, no account needed. You will get a private link to edit or
+    delete your ad later.
+  </p>
+
+  <% if (Object.keys(errors).length > 0) { %>
+    <div class="flash flash-error">Please fix the highlighted fields below.</div>
+  <% } %>
+
+  <form method="post" action="/post" enctype="multipart/form-data" class="stack" novalidate>
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+
+    <%- include('partials/listing-form', { values: values, errors: errors, categories: categories, limits: limits }) %>
+
+    <div class="field">
+      <label for="images">Photos <span class="hint">(up to 6, optional)</span></label>
+      <input id="images" name="images" type="file" accept="image/*" multiple>
+      <p class="hint">
+        JPEG, PNG, WebP or GIF. Photos are resized and stripped of location
+        data before publishing.
+      </p>
+      <% if (errors.images) { %><p class="field-error"><%= errors.images %></p><% } %>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">Publish ad</button>
+      <a class="btn btn-ghost" href="/">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<%- include('partials/foot') %>

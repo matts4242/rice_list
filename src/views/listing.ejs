@@ -1,0 +1,125 @@
+<%- include('partials/head') %>
+
+<nav class="breadcrumb">
+  <a href="/">All listings</a> ·
+  <a href="/?category=<%= listing.category_slug %>"><%= listing.category_name %></a>
+</nav>
+
+<% if (isAdmin && listing.status !== 'active') { %>
+  <div class="flash flash-warning">
+    Moderator view: this listing is <strong><%= listing.status %></strong>.
+    <% if (listing.removed_reason) { %> (<%= listing.removed_reason %>)<% } %>
+  </div>
+<% } %>
+
+<div class="detail">
+  <div class="detail-main">
+    <% if (listing.images.length > 0) { %>
+      <div class="gallery">
+        <img class="gallery-main" id="gallery-main"
+             src="/uploads/<%= listing.images[0] %>" alt="<%= listing.title %>">
+        <% if (listing.images.length > 1) { %>
+          <div class="gallery-thumbs">
+            <% listing.images.forEach(function (image, index) { %>
+              <button type="button" class="gallery-thumb <%= index === 0 ? 'is-current' : '' %>"
+                      data-full="/uploads/<%= image %>">
+                <img src="/uploads/<%= thumbFor(image) %>" alt="Photo <%= index + 1 %>" loading="lazy">
+              </button>
+            <% }); %>
+          </div>
+        <% } %>
+      </div>
+    <% } %>
+
+    <header class="detail-head">
+      <p class="detail-price"><%= format.formatPrice(listing.price_cents) %></p>
+      <h1 class="detail-title"><%= listing.title %></h1>
+      <p class="detail-meta">
+        <span><%= listing.category_name %></span>
+        <% if (listing.location) { %><span>· <%= listing.location %></span><% } %>
+        <span>· posted <%= format.timeAgo(listing.created_at) %></span>
+      </p>
+    </header>
+
+    <div class="prose"><%- format.paragraphs(listing.description) %></div>
+
+    <p class="detail-footnote">
+      Listing ID <code><%= listing.public_id %></code> ·
+      expires <%= format.formatDate(listing.expires_at) %> ·
+      <a href="/listing/<%= listing.public_id %>/report">Report this ad</a>
+    </p>
+  </div>
+
+  <aside class="detail-aside">
+    <section class="panel" id="contact">
+      <h2>Contact the seller</h2>
+      <% if (listing.show_phone && listing.contact_phone) { %>
+        <p class="phone">📞 <%= listing.contact_phone %></p>
+      <% } %>
+      <p class="panel-note">
+        Your message goes straight to the seller. Their email address is never
+        shown publicly.
+      </p>
+
+      <form method="post" action="/listing/<%= listing.public_id %>/contact" class="stack">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+
+        <div class="field">
+          <label for="sender_name">Your name</label>
+          <input id="sender_name" name="sender_name" required maxlength="<%= limits.senderName.max %>"
+                 value="<%= contact.values.senderName || '' %>">
+          <% if (contact.errors.sender_name) { %>
+            <p class="field-error"><%= contact.errors.sender_name %></p>
+          <% } %>
+        </div>
+
+        <div class="field">
+          <label for="sender_email">Your email</label>
+          <input id="sender_email" name="sender_email" type="email" required
+                 maxlength="<%= limits.email.max %>"
+                 value="<%= contact.values.senderEmail || '' %>">
+          <% if (contact.errors.sender_email) { %>
+            <p class="field-error"><%= contact.errors.sender_email %></p>
+          <% } %>
+        </div>
+
+        <div class="field">
+          <label for="body">Message</label>
+          <textarea id="body" name="body" rows="5" required
+                    minlength="<%= limits.messageBody.min %>"
+                    maxlength="<%= limits.messageBody.max %>"
+                    placeholder="Is this still available?"><%= contact.values.body || '' %></textarea>
+          <% if (contact.errors.body) { %>
+            <p class="field-error"><%= contact.errors.body %></p>
+          <% } %>
+        </div>
+
+        <div class="honeypot" aria-hidden="true">
+          <label for="website">Leave this field empty</label>
+          <input id="website" name="website" tabindex="-1" autocomplete="off">
+        </div>
+
+        <button class="btn btn-primary btn-block" type="submit">Send message</button>
+      </form>
+    </section>
+
+    <p class="safety">
+      <strong>Stay safe:</strong> meet in a public place, inspect items before
+      paying, and never send money in advance.
+    </p>
+  </aside>
+</div>
+
+<% if (similar.length > 0) { %>
+  <section class="similar">
+    <h2>More in <%= listing.category_name %></h2>
+    <div class="grid">
+      <% similar.forEach(function (item) { %>
+        <%- include('partials/listing-card', { listing: item, thumbFor: thumbFor, format: format }) %>
+      <% }); %>
+    </div>
+  </section>
+<% } %>
+
+<script src="/static/js/gallery.js" defer></script>
+<%- include('partials/foot') %>

@@ -1,0 +1,36 @@
+<%- include('partials/head') %>
+
+<div class="form-page form-page-narrow">
+  <h1>Report this listing</h1>
+  <p class="lede">
+    Reporting <a href="/listing/<%= listing.public_id %>"><%= listing.title %></a>.
+    Reports are reviewed by a moderator.
+  </p>
+
+  <form method="post" action="/listing/<%= listing.public_id %>/report" class="stack">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+
+    <fieldset class="fieldset">
+      <legend>What is wrong with this ad?</legend>
+      <% flagReasons.forEach(function (reason) { %>
+        <label class="radio">
+          <input type="radio" name="reason" value="<%= reason[0] %>" required>
+          <%= reason[1] %>
+        </label>
+      <% }); %>
+      <% if (errors.reason) { %><p class="field-error"><%= errors.reason %></p><% } %>
+    </fieldset>
+
+    <div class="field">
+      <label for="note">Anything else? <span class="hint">(optional)</span></label>
+      <textarea id="note" name="note" rows="4" maxlength="500"><%= values.note || '' %></textarea>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">Submit report</button>
+      <a class="btn btn-ghost" href="/listing/<%= listing.public_id %>">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<%- include('partials/foot') %>

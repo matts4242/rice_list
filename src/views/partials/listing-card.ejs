@@ -1,0 +1,23 @@
+<article class="card">
+  <a class="card-link" href="/listing/<%= listing.public_id %>">
+    <div class="card-media">
+      <% if (listing.images && listing.images.length > 0) { %>
+        <img src="/uploads/<%= thumbFor(listing.images[0]) %>" alt="" loading="lazy" width="480" height="360">
+      <% } else { %>
+        <span class="card-media-empty" aria-hidden="true">🍚</span>
+      <% } %>
+      <% if (listing.images && listing.images.length > 1) { %>
+        <span class="card-count"><%= listing.images.length %> photos</span>
+      <% } %>
+    </div>
+    <div class="card-body">
+      <p class="card-price"><%= format.formatPrice(listing.price_cents) %></p>
+      <h3 class="card-title"><%= listing.title %></h3>
+      <p class="card-meta">
+        <span><%= listing.category_name %></span>
+        <% if (listing.location) { %><span>· <%= listing.location %></span><% } %>
+      </p>
+      <p class="card-time"><%= format.timeAgo(listing.created_at) %></p>
+    </div>
+  </a>
+</article>
