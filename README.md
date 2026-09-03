@@ -97,15 +97,41 @@ src/
   scripts/          seed.js, hash-password.js
 public/             Stylesheet and the one small progressive-enhancement script
 tests/              Integration and unit tests
+deploy/             install.sh, the Ubuntu VPS installer
 data/               SQLite database and uploads (git-ignored, created at boot)
 ```
 
 ## Deploying
 
-Set `NODE_ENV=production`, a strong `SESSION_SECRET`, and `SITE_URL`. Run
-behind a TLS-terminating reverse proxy and set `TRUST_PROXY=1` so rate
-limiting sees real client addresses. Back up the `data/` directory — it holds
-both the database and the uploaded images.
+On a fresh Ubuntu VPS (24.04 or 26.04 LTS), `deploy/install.sh` does the whole
+thing — Node, a locked-down service account, systemd, nginx and a Let's
+Encrypt certificate:
+
+```bash
+git clone https://github.com/matts4242/rice_list.git
+sudo rice_list/deploy/install.sh --domain ads.example.com --email you@example.com
+```
+
+It puts the code in `/opt/ricelist` and the database and uploads in
+`/var/lib/ricelist`, outside the checkout, so re-running it upgrades the site
+without touching your data, session secret or admin password. Run
+`deploy/install.sh --help` for the options.
+
+To deploy by hand instead: set `NODE_ENV=production`, a strong
+`SESSION_SECRET`, and `SITE_URL`. Run behind a TLS-terminating reverse proxy
+and set `TRUST_PROXY=1` so rate limiting sees real client addresses. Two things
+are easy to get wrong:
+
+- **Serve it over HTTPS.** In production the session cookie is marked `Secure`,
+  so a browser will not store it over plain HTTP. The site still renders, but
+  every form fails — nobody can post, message, report or sign in to moderation.
+- **Raise the proxy's upload limit.** nginx allows 1 MB by default and will
+  reject photo uploads with a 413 before the app sees them. The app accepts
+  `MAX_IMAGES_PER_LISTING` files of `MAX_IMAGE_BYTES` each, 48 MB with the
+  defaults.
+
+Back up the data directory — it holds both the database and the uploaded
+images.
 
 ## Notes on security
 
