@@ -56,7 +56,9 @@ restore, dismiss reports, or delete permanently. Removal reasons are recorded
 and shown in the panel.
 
 **Expiry.** Listings expire after a configurable period and can be renewed
-from the management link.
+from the management link. The cutoff is applied as listings are read, so an ad
+goes quiet the moment it lapses; a background sweep only tidies the stored
+status afterwards.
 
 ## Configuration
 
@@ -74,9 +76,10 @@ seller's inbox rather than emailed.
 npm test
 ```
 
-60 tests covering validation and formatting, the posting and editing flows,
+71 tests covering validation and formatting, the posting and editing flows,
 search, manage-token authentication, contact messaging and relay failure,
-reporting and auto-hide, the moderation panel, and image handling.
+reporting and auto-hide, the moderation panel, image handling, expiry, and
+rate limiting.
 
 ## Layout
 
@@ -117,7 +120,9 @@ both the database and the uploaded images.
   `X-Content-Type-Options: nosniff`.
 - Admin sessions are regenerated on login so a pre-login cookie cannot be
   promoted. Passwords are stored as scrypt hashes.
-- Posting, messaging, reporting and login are rate limited per address.
+- Posting, messaging, editing, reporting and login are rate limited per
+  address. The edit limit runs before the upload parser, since the manage
+  token that authorises an edit arrives in the body multer is still reading.
 
 ## License
 

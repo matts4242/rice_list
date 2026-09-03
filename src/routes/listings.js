@@ -11,7 +11,7 @@ const { expireStaleListings } = require('../db');
 const { validateListing } = require('../lib/validate');
 const { upload, processImages, deleteImages, thumbFor } = require('../middleware/upload');
 const { verifyCsrf } = require('../middleware/csrf');
-const { postLimiter } = require('../middleware/rate-limit');
+const { postLimiter, editLimiter } = require('../middleware/rate-limit');
 
 const router = express.Router();
 
@@ -242,7 +242,11 @@ router.get('/listing/:publicId/manage', loadManagedListing, (req, res) => {
   });
 });
 
-router.post('/listing/:publicId/manage', handleUpload, loadManagedListing, async (req, res, next) => {
+// The limiter runs before handleUpload on purpose: multer buffers the whole
+// upload into memory, and the manage token that authorises the edit is inside
+// the body it is still parsing, so the throttle is the only check that can
+// happen before an anonymous caller makes us allocate.
+router.post('/listing/:publicId/manage', editLimiter, handleUpload, loadManagedListing, async (req, res, next) => {
   const categorySlugs = listings.allCategories().map((category) => category.slug);
   const { ok, errors, values } = validateListing(req.body, categorySlugs);
 

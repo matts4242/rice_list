@@ -30,8 +30,15 @@ function listFor(filterKey, { page = 1, perPage = 30, search = '' } = {}) {
   const params = {};
 
   if (search) {
-    conditions.push('(l.title LIKE @like OR l.contact_email LIKE @like OR l.public_id = @exact)');
-    params.like = `%${search}%`;
+    // Escape the LIKE wildcards so searching for "50%" or "a_b" looks for
+    // those characters rather than matching everything.
+    const escaped = search.replace(/[\\%_]/g, (char) => `\\${char}`);
+    conditions.push(
+      `(l.title LIKE @like ESCAPE '\\'
+        OR l.contact_email LIKE @like ESCAPE '\\'
+        OR l.public_id = @exact)`
+    );
+    params.like = `%${escaped}%`;
     params.exact = search;
   }
 

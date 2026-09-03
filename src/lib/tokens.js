@@ -6,11 +6,21 @@ const crypto = require('node:crypto');
 // copied out of an email.
 const ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
+// 256 is not a multiple of the alphabet size, so plain `byte % length` would
+// favour the first 256 % length characters. Reject the bytes in that ragged
+// tail and draw again: every character then comes out equally likely, which
+// is what the manage token's security rests on.
+const CEILING = 256 - (256 % ALPHABET.length);
+
 function randomId(length = 10) {
-  const bytes = crypto.randomBytes(length);
   let out = '';
-  for (let i = 0; i < length; i += 1) {
-    out += ALPHABET[bytes[i] % ALPHABET.length];
+  while (out.length < length) {
+    // Over-draw so the common case needs a single call to the CSPRNG.
+    for (const byte of crypto.randomBytes(length - out.length + 8)) {
+      if (byte >= CEILING) continue;
+      out += ALPHABET[byte % ALPHABET.length];
+      if (out.length === length) break;
+    }
   }
   return out;
 }
