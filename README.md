@@ -74,7 +74,7 @@ seller's inbox rather than emailed.
 npm test
 ```
 
-51 tests covering validation and formatting, the posting and editing flows,
+60 tests covering validation and formatting, the posting and editing flows,
 search, manage-token authentication, contact messaging and relay failure,
 reporting and auto-hide, the moderation panel, and image handling.
 
@@ -108,7 +108,9 @@ both the database and the uploaded images.
 
 - All state-changing requests carry a per-session CSRF token. Multipart
   uploads are verified after parsing, inside the single upload entry point,
-  so an upload route cannot skip the check.
+  so an upload route cannot skip the check. Only the known upload routes may
+  defer that check: a request to any other route is verified immediately,
+  whatever content type it claims.
 - Content Security Policy is restrictive: no inline scripts or styles, no
   third-party origins.
 - Uploads are re-encoded rather than trusted, and served with

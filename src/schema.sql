@@ -97,7 +97,15 @@ CREATE TRIGGER IF NOT EXISTS listings_fts_delete AFTER DELETE ON listings BEGIN
   VALUES ('delete', old.id, old.title, old.description, old.location);
 END;
 
-CREATE TRIGGER IF NOT EXISTS listings_fts_update AFTER UPDATE ON listings BEGIN
+-- Scoped to the indexed columns on purpose. An unscoped AFTER UPDATE fires on
+-- every view-count bump, status change and expiry sweep, each one rewriting
+-- the listing's FTS rows: the index bloats in proportion to traffic rather
+-- than to content. The DROP migrates databases created before this was fixed,
+-- since CREATE TRIGGER IF NOT EXISTS would keep the old one.
+DROP TRIGGER IF EXISTS listings_fts_update;
+
+CREATE TRIGGER IF NOT EXISTS listings_fts_update
+AFTER UPDATE OF title, description, location ON listings BEGIN
   INSERT INTO listings_fts (listings_fts, rowid, title, description, location)
   VALUES ('delete', old.id, old.title, old.description, old.location);
   INSERT INTO listings_fts (rowid, title, description, location)

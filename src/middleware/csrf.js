@@ -4,8 +4,26 @@ const crypto = require('node:crypto');
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
+/**
+ * The only routes that legitimately receive a multipart body, and so the only
+ * ones allowed to defer their CSRF check until multer has parsed it. Anything
+ * else claiming to be multipart is checked here and now — where its token has
+ * not been parsed and the check therefore fails, which is the point: a forged
+ * request must not be able to skip verification just by relabelling itself.
+ *
+ * Adding an upload route means adding it here; forgetting to fails closed.
+ */
+// Case-insensitive to match Express's own default routing, so a path that
+// reaches an upload route is a path that may defer.
+const MULTIPART_ROUTES = [/^\/post$/i, /^\/listing\/[^/]+\/manage$/i];
+
 function isMultipart(req) {
   return (req.get('content-type') || '').toLowerCase().startsWith('multipart/form-data');
+}
+
+function acceptsMultipart(req) {
+  const routePath = req.path.replace(/\/+$/, '') || '/';
+  return MULTIPART_ROUTES.some((pattern) => pattern.test(routePath));
 }
 
 function tokenIsValid(req) {
@@ -35,7 +53,8 @@ function reject(next) {
  *
  * Multipart bodies are not parsed yet at this point in the chain — multer
  * runs inside the route — so those requests are marked deferred and verified
- * by verifyCsrf once the body exists.
+ * by verifyCsrf once the body exists. Only the known upload routes may defer:
+ * see MULTIPART_ROUTES.
  */
 function csrf(req, res, next) {
   if (!req.session.csrfToken) {
@@ -48,7 +67,7 @@ function csrf(req, res, next) {
     return;
   }
 
-  if (isMultipart(req)) {
+  if (isMultipart(req) && acceptsMultipart(req)) {
     req.csrfDeferred = true;
     next();
     return;
