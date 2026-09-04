@@ -35,10 +35,23 @@ function adminIsConfigured() {
   return Boolean(config.admin.passwordHash || config.admin.plainPassword);
 }
 
-/** Only ever redirect to a path on this site. */
+/**
+ * Only ever redirect to a path on this site. Resolving the candidate against a
+ * dummy origin and checking the origin survived is what makes this safe: a
+ * prefix test misses `/\evil.com`, which browsers normalise to `//evil.com`
+ * and follow off-site. The URL parser applies the same rules the browser will.
+ */
 function safeNext(raw) {
   const value = typeof raw === 'string' ? raw : '';
-  return value.startsWith('/') && !value.startsWith('//') ? value : '/admin';
+  if (!value.startsWith('/')) return '/admin';
+  const base = 'http://localhost';
+  try {
+    const url = new URL(value, base);
+    if (url.origin !== base) return '/admin';
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return '/admin';
+  }
 }
 
 router.get('/login', (req, res) => {

@@ -56,7 +56,9 @@ restore, dismiss reports, or delete permanently. Removal reasons are recorded
 and shown in the panel.
 
 **Expiry.** Listings expire after a configurable period and can be renewed
-from the management link.
+from the management link. The cutoff is applied as listings are read, so an ad
+goes quiet the moment it lapses; a background sweep only tidies the stored
+status afterwards.
 
 ## Configuration
 
@@ -74,9 +76,10 @@ seller's inbox rather than emailed.
 npm test
 ```
 
-51 tests covering validation and formatting, the posting and editing flows,
+71 tests covering validation and formatting, the posting and editing flows,
 search, manage-token authentication, contact messaging and relay failure,
-reporting and auto-hide, the moderation panel, and image handling.
+reporting and auto-hide, the moderation panel, image handling, expiry, and
+rate limiting.
 
 ## Layout
 
@@ -94,28 +97,58 @@ src/
   scripts/          seed.js, hash-password.js
 public/             Stylesheet and the one small progressive-enhancement script
 tests/              Integration and unit tests
+deploy/             install.sh, the Ubuntu VPS installer
 data/               SQLite database and uploads (git-ignored, created at boot)
 ```
 
 ## Deploying
 
-Set `NODE_ENV=production`, a strong `SESSION_SECRET`, and `SITE_URL`. Run
-behind a TLS-terminating reverse proxy and set `TRUST_PROXY=1` so rate
-limiting sees real client addresses. Back up the `data/` directory — it holds
-both the database and the uploaded images.
+On a fresh Ubuntu VPS (24.04 or 26.04 LTS), `deploy/install.sh` does the whole
+thing — Node, a locked-down service account, systemd, nginx and a Let's
+Encrypt certificate:
+
+```bash
+git clone https://github.com/matts4242/rice_list.git
+sudo rice_list/deploy/install.sh --domain ads.example.com --email you@example.com
+```
+
+It puts the code in `/opt/ricelist` and the database and uploads in
+`/var/lib/ricelist`, outside the checkout, so re-running it upgrades the site
+without touching your data, session secret or admin password. Run
+`deploy/install.sh --help` for the options.
+
+To deploy by hand instead: set `NODE_ENV=production`, a strong
+`SESSION_SECRET`, and `SITE_URL`. Run behind a TLS-terminating reverse proxy
+and set `TRUST_PROXY=1` so rate limiting sees real client addresses. Two things
+are easy to get wrong:
+
+- **Serve it over HTTPS.** In production the session cookie is marked `Secure`,
+  so a browser will not store it over plain HTTP. The site still renders, but
+  every form fails — nobody can post, message, report or sign in to moderation.
+- **Raise the proxy's upload limit.** nginx allows 1 MB by default and will
+  reject photo uploads with a 413 before the app sees them. The app accepts
+  `MAX_IMAGES_PER_LISTING` files of `MAX_IMAGE_BYTES` each, 48 MB with the
+  defaults.
+
+Back up the data directory — it holds both the database and the uploaded
+images.
 
 ## Notes on security
 
 - All state-changing requests carry a per-session CSRF token. Multipart
   uploads are verified after parsing, inside the single upload entry point,
-  so an upload route cannot skip the check.
+  so an upload route cannot skip the check. Only the known upload routes may
+  defer that check: a request to any other route is verified immediately,
+  whatever content type it claims.
 - Content Security Policy is restrictive: no inline scripts or styles, no
   third-party origins.
 - Uploads are re-encoded rather than trusted, and served with
   `X-Content-Type-Options: nosniff`.
 - Admin sessions are regenerated on login so a pre-login cookie cannot be
   promoted. Passwords are stored as scrypt hashes.
-- Posting, messaging, reporting and login are rate limited per address.
+- Posting, messaging, editing, reporting and login are rate limited per
+  address. The edit limit runs before the upload parser, since the manage
+  token that authorises an edit arrives in the body multer is still reading.
 
 ## License
 

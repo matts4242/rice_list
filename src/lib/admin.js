@@ -5,7 +5,7 @@ const { getDb } = require('../db');
 const ADMIN_COLUMNS = `
   l.id, l.public_id, l.title, l.price_cents, l.location, l.contact_email,
   l.status, l.removed_reason, l.flag_count, l.view_count, l.created_at,
-  l.expires_at, c.name AS category_name, c.slug AS category_slug,
+  l.updated_at, l.expires_at, c.name AS category_name, c.slug AS category_slug,
   (SELECT count(*) FROM flags f WHERE f.listing_id = l.id AND f.resolved = 0)
     AS open_flags,
   (SELECT count(*) FROM messages m WHERE m.listing_id = l.id) AS message_count
@@ -30,8 +30,15 @@ function listFor(filterKey, { page = 1, perPage = 30, search = '' } = {}) {
   const params = {};
 
   if (search) {
-    conditions.push('(l.title LIKE @like OR l.contact_email LIKE @like OR l.public_id = @exact)');
-    params.like = `%${search}%`;
+    // Escape the LIKE wildcards so searching for "50%" or "a_b" looks for
+    // those characters rather than matching everything.
+    const escaped = search.replace(/[\\%_]/g, (char) => `\\${char}`);
+    conditions.push(
+      `(l.title LIKE @like ESCAPE '\\'
+        OR l.contact_email LIKE @like ESCAPE '\\'
+        OR l.public_id = @exact)`
+    );
+    params.like = `%${escaped}%`;
     params.exact = search;
   }
 
@@ -51,7 +58,7 @@ function listFor(filterKey, { page = 1, perPage = 30, search = '' } = {}) {
   const rows = getDb()
     .prepare(
       `SELECT * ${base}
-        ORDER BY ${filter.order.replace(/\bl\./g, '')}
+        ORDER BY ${filter.order}
         LIMIT @limit OFFSET @offset`
     )
     .all({ ...params, limit: perPage, offset: (currentPage - 1) * perPage });

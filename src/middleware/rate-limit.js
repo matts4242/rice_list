@@ -30,6 +30,12 @@ const messageLimiter = limiter({
   message: 'You have sent a lot of messages recently. Please try again later.',
 });
 
+const editLimiter = limiter({
+  max: config.listings.editsPerHour,
+  windowMs: 60 * 60 * 1000,
+  message: 'You have edited a lot of ads recently. Please try again later.',
+});
+
 const flagLimiter = limiter({
   max: 20,
   windowMs: 60 * 60 * 1000,
@@ -42,4 +48,4 @@ const loginLimiter = limiter({
   message: 'Too many login attempts. Please wait and try again.',
 });
 
-module.exports = { postLimiter, messageLimiter, flagLimiter, loginLimiter };
+module.exports = { postLimiter, messageLimiter, editLimiter, flagLimiter, loginLimiter };

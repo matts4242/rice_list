@@ -59,6 +59,11 @@ module.exports = {
     // Ads posted per hour from a single address before we start rejecting.
     postsPerHour: int(process.env.POSTS_PER_HOUR, 5),
     messagesPerHour: int(process.env.MESSAGES_PER_HOUR, 10),
+    // Edits buffer their uploads before the manage token can be checked — the
+    // token arrives in the body multer is still parsing — so this is the only
+    // thing standing between an anonymous caller and repeated multi-megabyte
+    // allocations on someone else's listing.
+    editsPerHour: int(process.env.EDITS_PER_HOUR, 30),
     // A listing hidden from browse once this many people report it.
     autoHideFlagCount: int(process.env.AUTO_HIDE_FLAG_COUNT, 5),
   },

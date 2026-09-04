@@ -4,12 +4,26 @@ const { getDb } = require('../db');
 const config = require('../config');
 const { randomId, hashToken, tokenMatches } = require('./tokens');
 
+// status is derived rather than read straight from the column: the stored
+// value only catches up when the expiry sweep runs, so between a listing
+// lapsing and the next sweep the column still says 'active'. Deciding it in
+// the query means a lapsed ad is never served, contacted or reported, however
+// long ago the last sweep was.
+const EFFECTIVE_STATUS = `
+  CASE WHEN l.status = 'active' AND l.expires_at <= datetime('now')
+       THEN 'expired' ELSE l.status END
+`;
+
 const LISTING_COLUMNS = `
   l.id, l.public_id, l.title, l.description, l.price_cents, l.location,
-  l.contact_email, l.contact_phone, l.show_phone, l.status, l.removed_reason,
+  l.contact_email, l.contact_phone, l.show_phone, l.removed_reason,
+  ${EFFECTIVE_STATUS} AS status,
   l.flag_count, l.view_count, l.created_at, l.updated_at, l.expires_at,
   c.slug AS category_slug, c.name AS category_name
 `;
+
+// The browse-side counterpart: 'active' in the column *and* not yet lapsed.
+const IS_LIVE = "l.status = 'active' AND l.expires_at > datetime('now')";
 
 function allCategories() {
   return getDb()
@@ -62,7 +76,7 @@ function toFtsQuery(search) {
  * rather than in each caller.
  */
 function browse({ categorySlug = null, search = '', page = 1, perPage = config.listings.perPage } = {}) {
-  const where = ["l.status = 'active'"];
+  const where = [IS_LIVE];
   const params = {};
 
   if (categorySlug) {
@@ -131,7 +145,7 @@ function similarListings(listing, limit = 4) {
     .prepare(
       `SELECT ${LISTING_COLUMNS}
          FROM listings l JOIN categories c ON c.id = l.category_id
-        WHERE l.status = 'active' AND c.slug = ? AND l.id != ?
+        WHERE ${IS_LIVE} AND c.slug = ? AND l.id != ?
         ORDER BY l.created_at DESC
         LIMIT ?`
     )
