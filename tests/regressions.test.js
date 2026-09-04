@@ -369,3 +369,27 @@ test('admin search finds a listing whose title really contains a percent sign', 
 
 // Edit throttling is behavioural and needs rate limiting switched on, so it
 // lives in its own file: see tests/rate-limits.test.js.
+
+// ---------------------------------------------------------------------------
+// Bind address: the app must be able to hide behind the proxy.
+// ---------------------------------------------------------------------------
+
+test('the bind address defaults to every interface and honours HOST', () => {
+  // With trustProxy on, a client that reaches the port without going through
+  // nginx sets its own X-Forwarded-For and so chooses its own rate-limit
+  // identity. Binding to loopback is what removes that path, so HOST has to
+  // be settable -- and has to keep defaulting to 0.0.0.0 for local use.
+  const { execFileSync } = require('node:child_process');
+  const path = require('node:path');
+  const root = path.join(__dirname, '..');
+
+  const hostFor = (host) =>
+    execFileSync(process.execPath, ['-e', 'console.log(require("./src/config").host)'], {
+      cwd: root,
+      env: { ...process.env, NODE_ENV: 'test', HOST: host },
+      encoding: 'utf8',
+    }).trim();
+
+  assert.equal(hostFor(''), '0.0.0.0');
+  assert.equal(hostFor('127.0.0.1'), '127.0.0.1');
+});

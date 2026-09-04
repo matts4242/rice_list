@@ -40,6 +40,10 @@ module.exports = {
   rootDir,
   dataDir,
   port: int(process.env.PORT, 3000),
+  // Interface to bind. Behind a reverse proxy this should be 127.0.0.1: with
+  // trustProxy on, anything that can reach the port directly sets its own
+  // X-Forwarded-For, and so picks its own identity for rate limiting.
+  host: process.env.HOST || '0.0.0.0',
   siteName: process.env.SITE_NAME || 'Rice List',
   siteUrl: (process.env.SITE_URL || 'http://localhost:3000').replace(/\/$/, ''),
   databasePath: process.env.DATABASE_PATH

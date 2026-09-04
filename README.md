@@ -76,7 +76,7 @@ seller's inbox rather than emailed.
 npm test
 ```
 
-71 tests covering validation and formatting, the posting and editing flows,
+72 tests covering validation and formatting, the posting and editing flows,
 search, manage-token authentication, contact messaging and relay failure,
 reporting and auto-hide, the moderation panel, image handling, expiry, and
 rate limiting.
@@ -129,6 +129,11 @@ are easy to get wrong:
   reject photo uploads with a 413 before the app sees them. The app accepts
   `MAX_IMAGES_PER_LISTING` files of `MAX_IMAGE_BYTES` each, 48 MB with the
   defaults.
+- **Set `HOST=127.0.0.1` whenever `TRUST_PROXY=1`.** Together they mean the
+  app trusts `X-Forwarded-For`, so anything that can reach the port without
+  going through the proxy picks its own client address — and walks through
+  every rate limit. Binding to loopback closes that path. The server warns at
+  startup if it finds the two settings in the dangerous combination.
 
 Back up the data directory — it holds both the database and the uploaded
 images.

@@ -146,6 +146,27 @@ if [ -n "$ADMIN_PASSWORD_FILE" ] && [ ! -r "$ADMIN_PASSWORD_FILE" ]; then
   die "cannot read --admin-password-file: $ADMIN_PASSWORD_FILE"
 fi
 
+# Something already on the port is nearly always an earlier hand-rolled run of
+# this app. Left alone it would win the bind and the new service would crash
+# loop, so say so now rather than fifteen steps from here.
+if command -v ss >/dev/null 2>&1; then
+  port_holder="$(ss -lntpH "sport = :${PORT}" 2>/dev/null || true)"
+  if [ -n "$port_holder" ] && ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    warn "Something is already listening on port ${PORT}:"
+    warn "  $(printf '%s' "$port_holder" | head -n 1 | tr -s ' ')"
+    warn "That is usually this app started by hand. Stop it before continuing,"
+    warn "or pass --port to run alongside it. Note that a copy left running on"
+    warn "a public interface stays reachable without TLS and bypasses nginx."
+    if [ -t 0 ]; then
+      printf '    Continue anyway? [y/N] '
+      read -r reply
+      case "$reply" in [yY]*) : ;; *) die "stopped." ;; esac
+    else
+      die "refusing to continue with port ${PORT} in use (no terminal to confirm on)."
+    fi
+  fi
+fi
+
 if [ "$NO_TLS" = "yes" ]; then
   warn "TLS is disabled. Unless something in front of this host terminates"
   warn "TLS and forwards X-Forwarded-Proto, every form on the site will fail:"
@@ -340,6 +361,13 @@ cat > "$ENV_FILE" <<ENVFILE
 
 NODE_ENV=production
 PORT=${PORT}
+
+# Loopback only. nginx reaches the app over 127.0.0.1, and binding no wider
+# means nothing can skip it: with TRUST_PROXY=1 below, a client that reached
+# this port directly could set X-Forwarded-For and pick its own identity,
+# which would let it walk straight through every rate limit.
+HOST=127.0.0.1
+
 SITE_NAME=${SITE_NAME}
 SITE_URL=${SITE_URL}
 SESSION_SECRET=${SESSION_SECRET}
