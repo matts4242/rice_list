@@ -278,6 +278,18 @@ fi
 
 command -v npm >/dev/null || die "npm was not installed alongside Node."
 
+# Pin the interpreter. A machine can carry more than one Node -- a system
+# package plus an nvm build, say -- and root's PATH and sudo's secure_path can
+# resolve different ones. Native modules like better-sqlite3 are compiled for
+# the exact ABI of whichever node ran npm, so if the service then starts under
+# a different node it dies on ERR_DLOPEN_FAILED. Build and run with the same
+# binary by putting it first on the PATH for every command we run as the
+# service user, and naming it in the unit.
+NODE_BIN="$(command -v node)"
+NODE_DIR="$(dirname "$NODE_BIN")"
+SERVICE_PATH="${NODE_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+info "Using ${NODE_BIN} for both the build and the service"
+
 # --- Service account and directories ----------------------------------------
 
 step "Creating the service account"
@@ -298,7 +310,9 @@ ok "Data directory ready at $DATA_DIR"
 
 step "Fetching the application"
 
-run_as_service() { sudo -u "$SERVICE_USER" HOME="$DATA_DIR" "$@"; }
+run_as_service() {
+  sudo -u "$SERVICE_USER" env "PATH=$SERVICE_PATH" "HOME=$DATA_DIR" "$@"
+}
 
 if [ -d "$APP_DIR/.git" ]; then
   info "Updating the existing checkout"
@@ -487,7 +501,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${APP_DIR}
-ExecStart=$(command -v node) ${APP_DIR}/src/server.js
+ExecStart=${NODE_BIN} ${APP_DIR}/src/server.js
 Restart=on-failure
 RestartSec=5s
 # server.js closes the listener on SIGTERM, which systemd sends by default.

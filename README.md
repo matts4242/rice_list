@@ -97,16 +97,17 @@ src/
   scripts/          seed.js, hash-password.js
 public/             Stylesheet and the one small progressive-enhancement script
 tests/              Integration and unit tests
-deploy/             setup-vps.sh (machine setup), install.sh (the app)
+deploy/             setup-vps.sh, install.sh, redeploy.sh
 data/               SQLite database and uploads (git-ignored, created at boot)
 ```
 
 ## Deploying
 
-Two scripts, in order. `deploy/setup-vps.sh` configures the machine — updates,
-swap, an admin account, SSH hardening, a firewall, fail2ban and automatic
-security updates. `deploy/install.sh` then installs the application: Node, a
+Three scripts. `deploy/setup-vps.sh` configures the machine — updates, swap, an
+admin account, SSH hardening, a firewall, fail2ban and automatic security
+updates. `deploy/install.sh` then installs the application: Node, a
 locked-down service account, systemd, nginx and a Let's Encrypt certificate.
+`deploy/redeploy.sh` handles every update after that.
 
 ```bash
 git clone https://github.com/matts4242/rice_list.git
@@ -133,8 +134,24 @@ config file. Both risky steps are opt-in.
 
 `install.sh` puts the code in `/opt/ricelist` and the database and uploads in
 `/var/lib/ricelist`, outside the checkout, so re-running it upgrades the site
-without touching your data, session secret or admin password. Both scripts
-take `--help`.
+without touching your data, session secret or admin password.
+
+For routine updates after that, `deploy/redeploy.sh` is quicker and knows how
+to undo itself:
+
+```bash
+sudo ./deploy/redeploy.sh                 # latest of the current branch
+sudo ./deploy/redeploy.sh --ref v1.2.0    # a tag, branch or commit
+```
+
+It backs up the database first (through SQLite's backup API, so a WAL-mode
+database is captured consistently), checks out the new revision, reinstalls,
+restarts, and polls `/health`. If the site does not come back it restores the
+previous commit and restarts again, so a bad release self-corrects and you get
+a working site plus the failing commit and a pointer to the log. It never
+rolls the database back on its own — that could discard writes made after the
+backup — so a release that damages data is restored by hand from the backup it
+names. All three scripts take `--help`.
 
 To deploy by hand instead: set `NODE_ENV=production`, a strong
 `SESSION_SECRET`, and `SITE_URL`. Run behind a TLS-terminating reverse proxy
