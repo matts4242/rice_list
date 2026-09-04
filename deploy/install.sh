@@ -149,9 +149,27 @@ fi
 # Something already on the port is nearly always an earlier hand-rolled run of
 # this app. Left alone it would win the bind and the new service would crash
 # loop, so say so now rather than fifteen steps from here.
+
+# Is the process on the port one of ours? On an upgrade it always is -- the
+# running service holds its own port -- and asking systemd alone is not enough
+# to tell: a unit that is failed, activating, or was renamed still leaves a
+# process listening, and blocking on that would refuse every legitimate
+# re-run. Identify it by what it is rather than by what systemd says.
+port_holder_is_ours() {
+  local holder="$1" pid
+  pid="$(printf '%s' "$holder" | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2)"
+  [ -n "$pid" ] || return 1
+  if tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qF "$APP_DIR"; then
+    return 0
+  fi
+  [ "$(stat -c %U "/proc/${pid}" 2>/dev/null)" = "$SERVICE_USER" ]
+}
+
 if command -v ss >/dev/null 2>&1; then
   port_holder="$(ss -lntpH "sport = :${PORT}" 2>/dev/null || true)"
-  if [ -n "$port_holder" ] && ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+  if [ -n "$port_holder" ] \
+     && ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null \
+     && ! port_holder_is_ours "$port_holder"; then
     warn "Something is already listening on port ${PORT}:"
     warn "  $(printf '%s' "$port_holder" | head -n 1 | tr -s ' ')"
     warn "That is usually this app started by hand. Stop it before continuing,"
@@ -299,12 +317,54 @@ fi
 ok "Source at $(run_as_service git -C "$APP_DIR" rev-parse --short HEAD)"
 
 step "Installing dependencies"
+
 # Runs as the service user, so npm lifecycle scripts never execute as root.
-if ! run_as_service npm --prefix "$APP_DIR" ci --omit=dev --no-audit --no-fund; then
-  die "npm ci failed. The output above says why; native modules usually need
-     build-essential and python3, which this script installs."
+install_dependencies() {
+  run_as_service npm --prefix "$APP_DIR" ci --omit=dev --no-audit --no-fund
+}
+
+# npm's exit code is not evidence that anything was installed. Its "Exit
+# handler never called" bug leaves the dependency directories behind as empty
+# shells and still exits 0, which produces a service that crash loops on
+# MODULE_NOT_FOUND while the installer claims success. Ask the question that
+# actually matters instead: do the declared dependencies load?
+missing_dependencies() {
+  run_as_service node -e '
+    const path = require("node:path");
+    const root = process.argv[1];
+    const pkg = require(path.join(root, "package.json"));
+    const missing = Object.keys(pkg.dependencies || {}).filter((dep) => {
+      try {
+        require.resolve(dep, { paths: [root] });
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    process.stdout.write(missing.join(" "));
+  ' "$APP_DIR" 2>/dev/null || printf 'unknown'
+}
+
+install_dependencies || warn "npm reported a failure; checking what landed."
+
+missing="$(missing_dependencies)"
+if [ -n "$missing" ]; then
+  warn "These dependencies did not install: ${missing}"
+  warn "Clearing node_modules and trying once more."
+  run_as_service rm -rf "$APP_DIR/node_modules"
+  install_dependencies || true
+  missing="$(missing_dependencies)"
 fi
-ok "Dependencies installed"
+
+if [ -n "$missing" ]; then
+  die "dependencies are still missing after a clean retry: ${missing}
+     The service cannot start without them. Look at the npm output above;
+     a native module that has to compile needs build-essential and python3,
+     which this script installs, and enough memory to run the compiler.
+     Retry by hand with:
+       sudo -u ${SERVICE_USER} HOME=${DATA_DIR} npm --prefix ${APP_DIR} ci --omit=dev"
+fi
+ok "Dependencies installed and verified"
 
 # --- Configuration ----------------------------------------------------------
 
