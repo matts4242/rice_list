@@ -97,25 +97,44 @@ src/
   scripts/          seed.js, hash-password.js
 public/             Stylesheet and the one small progressive-enhancement script
 tests/              Integration and unit tests
-deploy/             install.sh, the Ubuntu VPS installer
+deploy/             setup-vps.sh (machine setup), install.sh (the app)
 data/               SQLite database and uploads (git-ignored, created at boot)
 ```
 
 ## Deploying
 
-On a fresh Ubuntu VPS (24.04 or 26.04 LTS), `deploy/install.sh` does the whole
-thing — Node, a locked-down service account, systemd, nginx and a Let's
-Encrypt certificate:
+Two scripts, in order. `deploy/setup-vps.sh` configures the machine — updates,
+swap, an admin account, SSH hardening, a firewall, fail2ban and automatic
+security updates. `deploy/install.sh` then installs the application: Node, a
+locked-down service account, systemd, nginx and a Let's Encrypt certificate.
 
 ```bash
 git clone https://github.com/matts4242/rice_list.git
-sudo rice_list/deploy/install.sh --domain ads.example.com --email you@example.com
+cd rice_list
+
+# 1. Prepare the machine. --dry-run first prints every change without
+#    making any of them, which is worth reading before you commit to it.
+sudo ./deploy/setup-vps.sh --dry-run --hostname ricelist \
+     --admin-user you --ssh-key-file ~/.ssh/id_ed25519.pub --harden-ssh
+sudo ./deploy/setup-vps.sh --hostname ricelist \
+     --admin-user you --ssh-key-file ~/.ssh/id_ed25519.pub --harden-ssh
+
+# 2. Open a second SSH session and check you can still log in, before
+#    closing the first one.
+
+# 3. Point DNS at the box, then install the site.
+sudo ./deploy/install.sh --domain ads.example.com --email you@example.com
 ```
 
-It puts the code in `/opt/ricelist` and the database and uploads in
+`setup-vps.sh` will not disable password logins unless an authorised key is
+already in place, and never enables the firewall before allowing SSH through
+it — it reads the port sshd is actually listening on rather than trusting the
+config file. Both risky steps are opt-in.
+
+`install.sh` puts the code in `/opt/ricelist` and the database and uploads in
 `/var/lib/ricelist`, outside the checkout, so re-running it upgrades the site
-without touching your data, session secret or admin password. Run
-`deploy/install.sh --help` for the options.
+without touching your data, session secret or admin password. Both scripts
+take `--help`.
 
 To deploy by hand instead: set `NODE_ENV=production`, a strong
 `SESSION_SECRET`, and `SITE_URL`. Run behind a TLS-terminating reverse proxy
