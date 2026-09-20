@@ -76,7 +76,7 @@ seller's inbox rather than emailed.
 npm test
 ```
 
-71 tests covering validation and formatting, the posting and editing flows,
+72 tests covering validation and formatting, the posting and editing flows,
 search, manage-token authentication, contact messaging and relay failure,
 reporting and auto-hide, the moderation panel, image handling, expiry, and
 rate limiting.
@@ -97,25 +97,61 @@ src/
   scripts/          seed.js, hash-password.js
 public/             Stylesheet and the one small progressive-enhancement script
 tests/              Integration and unit tests
-deploy/             install.sh, the Ubuntu VPS installer
+deploy/             setup-vps.sh, install.sh, redeploy.sh
 data/               SQLite database and uploads (git-ignored, created at boot)
 ```
 
 ## Deploying
 
-On a fresh Ubuntu VPS (24.04 or 26.04 LTS), `deploy/install.sh` does the whole
-thing — Node, a locked-down service account, systemd, nginx and a Let's
-Encrypt certificate:
+Three scripts. `deploy/setup-vps.sh` configures the machine — updates, swap, an
+admin account, SSH hardening, a firewall, fail2ban and automatic security
+updates. `deploy/install.sh` then installs the application: Node, a
+locked-down service account, systemd, nginx and a Let's Encrypt certificate.
+`deploy/redeploy.sh` handles every update after that.
 
 ```bash
 git clone https://github.com/matts4242/rice_list.git
-sudo rice_list/deploy/install.sh --domain ads.example.com --email you@example.com
+cd rice_list
+
+# 1. Prepare the machine. --dry-run first prints every change without
+#    making any of them, which is worth reading before you commit to it.
+sudo ./deploy/setup-vps.sh --dry-run --hostname ricelist \
+     --admin-user you --ssh-key-file ~/.ssh/id_ed25519.pub --harden-ssh
+sudo ./deploy/setup-vps.sh --hostname ricelist \
+     --admin-user you --ssh-key-file ~/.ssh/id_ed25519.pub --harden-ssh
+
+# 2. Open a second SSH session and check you can still log in, before
+#    closing the first one.
+
+# 3. Point DNS at the box, then install the site.
+sudo ./deploy/install.sh --domain ads.example.com --email you@example.com
 ```
 
-It puts the code in `/opt/ricelist` and the database and uploads in
+`setup-vps.sh` will not disable password logins unless an authorised key is
+already in place, and never enables the firewall before allowing SSH through
+it — it reads the port sshd is actually listening on rather than trusting the
+config file. Both risky steps are opt-in.
+
+`install.sh` puts the code in `/opt/ricelist` and the database and uploads in
 `/var/lib/ricelist`, outside the checkout, so re-running it upgrades the site
-without touching your data, session secret or admin password. Run
-`deploy/install.sh --help` for the options.
+without touching your data, session secret or admin password.
+
+For routine updates after that, `deploy/redeploy.sh` is quicker and knows how
+to undo itself:
+
+```bash
+sudo ./deploy/redeploy.sh                 # latest of the current branch
+sudo ./deploy/redeploy.sh --ref v1.2.0    # a tag, branch or commit
+```
+
+It backs up the database first (through SQLite's backup API, so a WAL-mode
+database is captured consistently), checks out the new revision, reinstalls,
+restarts, and polls `/health`. If the site does not come back it restores the
+previous commit and restarts again, so a bad release self-corrects and you get
+a working site plus the failing commit and a pointer to the log. It never
+rolls the database back on its own — that could discard writes made after the
+backup — so a release that damages data is restored by hand from the backup it
+names. All three scripts take `--help`.
 
 To deploy by hand instead: set `NODE_ENV=production`, a strong
 `SESSION_SECRET`, and `SITE_URL`. Run behind a TLS-terminating reverse proxy
@@ -129,6 +165,11 @@ are easy to get wrong:
   reject photo uploads with a 413 before the app sees them. The app accepts
   `MAX_IMAGES_PER_LISTING` files of `MAX_IMAGE_BYTES` each, 48 MB with the
   defaults.
+- **Set `HOST=127.0.0.1` whenever `TRUST_PROXY=1`.** Together they mean the
+  app trusts `X-Forwarded-For`, so anything that can reach the port without
+  going through the proxy picks its own client address — and walks through
+  every rate limit. Binding to loopback closes that path. The server warns at
+  startup if it finds the two settings in the dangerous combination.
 
 Back up the data directory — it holds both the database and the uploaded
 images.

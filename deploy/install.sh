@@ -146,6 +146,45 @@ if [ -n "$ADMIN_PASSWORD_FILE" ] && [ ! -r "$ADMIN_PASSWORD_FILE" ]; then
   die "cannot read --admin-password-file: $ADMIN_PASSWORD_FILE"
 fi
 
+# Something already on the port is nearly always an earlier hand-rolled run of
+# this app. Left alone it would win the bind and the new service would crash
+# loop, so say so now rather than fifteen steps from here.
+
+# Is the process on the port one of ours? On an upgrade it always is -- the
+# running service holds its own port -- and asking systemd alone is not enough
+# to tell: a unit that is failed, activating, or was renamed still leaves a
+# process listening, and blocking on that would refuse every legitimate
+# re-run. Identify it by what it is rather than by what systemd says.
+port_holder_is_ours() {
+  local holder="$1" pid
+  pid="$(printf '%s' "$holder" | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2)"
+  [ -n "$pid" ] || return 1
+  if tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qF "$APP_DIR"; then
+    return 0
+  fi
+  [ "$(stat -c %U "/proc/${pid}" 2>/dev/null)" = "$SERVICE_USER" ]
+}
+
+if command -v ss >/dev/null 2>&1; then
+  port_holder="$(ss -lntpH "sport = :${PORT}" 2>/dev/null || true)"
+  if [ -n "$port_holder" ] \
+     && ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null \
+     && ! port_holder_is_ours "$port_holder"; then
+    warn "Something is already listening on port ${PORT}:"
+    warn "  $(printf '%s' "$port_holder" | head -n 1 | tr -s ' ')"
+    warn "That is usually this app started by hand. Stop it before continuing,"
+    warn "or pass --port to run alongside it. Note that a copy left running on"
+    warn "a public interface stays reachable without TLS and bypasses nginx."
+    if [ -t 0 ]; then
+      printf '    Continue anyway? [y/N] '
+      read -r reply
+      case "$reply" in [yY]*) : ;; *) die "stopped." ;; esac
+    else
+      die "refusing to continue with port ${PORT} in use (no terminal to confirm on)."
+    fi
+  fi
+fi
+
 if [ "$NO_TLS" = "yes" ]; then
   warn "TLS is disabled. Unless something in front of this host terminates"
   warn "TLS and forwards X-Forwarded-Proto, every form on the site will fail:"
@@ -239,6 +278,18 @@ fi
 
 command -v npm >/dev/null || die "npm was not installed alongside Node."
 
+# Pin the interpreter. A machine can carry more than one Node -- a system
+# package plus an nvm build, say -- and root's PATH and sudo's secure_path can
+# resolve different ones. Native modules like better-sqlite3 are compiled for
+# the exact ABI of whichever node ran npm, so if the service then starts under
+# a different node it dies on ERR_DLOPEN_FAILED. Build and run with the same
+# binary by putting it first on the PATH for every command we run as the
+# service user, and naming it in the unit.
+NODE_BIN="$(command -v node)"
+NODE_DIR="$(dirname "$NODE_BIN")"
+SERVICE_PATH="${NODE_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+info "Using ${NODE_BIN} for both the build and the service"
+
 # --- Service account and directories ----------------------------------------
 
 step "Creating the service account"
@@ -259,7 +310,9 @@ ok "Data directory ready at $DATA_DIR"
 
 step "Fetching the application"
 
-run_as_service() { sudo -u "$SERVICE_USER" HOME="$DATA_DIR" "$@"; }
+run_as_service() {
+  sudo -u "$SERVICE_USER" env "PATH=$SERVICE_PATH" "HOME=$DATA_DIR" "$@"
+}
 
 if [ -d "$APP_DIR/.git" ]; then
   info "Updating the existing checkout"
@@ -278,12 +331,54 @@ fi
 ok "Source at $(run_as_service git -C "$APP_DIR" rev-parse --short HEAD)"
 
 step "Installing dependencies"
+
 # Runs as the service user, so npm lifecycle scripts never execute as root.
-if ! run_as_service npm --prefix "$APP_DIR" ci --omit=dev --no-audit --no-fund; then
-  die "npm ci failed. The output above says why; native modules usually need
-     build-essential and python3, which this script installs."
+install_dependencies() {
+  run_as_service npm --prefix "$APP_DIR" ci --omit=dev --no-audit --no-fund
+}
+
+# npm's exit code is not evidence that anything was installed. Its "Exit
+# handler never called" bug leaves the dependency directories behind as empty
+# shells and still exits 0, which produces a service that crash loops on
+# MODULE_NOT_FOUND while the installer claims success. Ask the question that
+# actually matters instead: do the declared dependencies load?
+missing_dependencies() {
+  run_as_service node -e '
+    const path = require("node:path");
+    const root = process.argv[1];
+    const pkg = require(path.join(root, "package.json"));
+    const missing = Object.keys(pkg.dependencies || {}).filter((dep) => {
+      try {
+        require.resolve(dep, { paths: [root] });
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    process.stdout.write(missing.join(" "));
+  ' "$APP_DIR" 2>/dev/null || printf 'unknown'
+}
+
+install_dependencies || warn "npm reported a failure; checking what landed."
+
+missing="$(missing_dependencies)"
+if [ -n "$missing" ]; then
+  warn "These dependencies did not install: ${missing}"
+  warn "Clearing node_modules and trying once more."
+  run_as_service rm -rf "$APP_DIR/node_modules"
+  install_dependencies || true
+  missing="$(missing_dependencies)"
 fi
-ok "Dependencies installed"
+
+if [ -n "$missing" ]; then
+  die "dependencies are still missing after a clean retry: ${missing}
+     The service cannot start without them. Look at the npm output above;
+     a native module that has to compile needs build-essential and python3,
+     which this script installs, and enough memory to run the compiler.
+     Retry by hand with:
+       sudo -u ${SERVICE_USER} HOME=${DATA_DIR} npm --prefix ${APP_DIR} ci --omit=dev"
+fi
+ok "Dependencies installed and verified"
 
 # --- Configuration ----------------------------------------------------------
 
@@ -340,6 +435,13 @@ cat > "$ENV_FILE" <<ENVFILE
 
 NODE_ENV=production
 PORT=${PORT}
+
+# Loopback only. nginx reaches the app over 127.0.0.1, and binding no wider
+# means nothing can skip it: with TRUST_PROXY=1 below, a client that reached
+# this port directly could set X-Forwarded-For and pick its own identity,
+# which would let it walk straight through every rate limit.
+HOST=127.0.0.1
+
 SITE_NAME=${SITE_NAME}
 SITE_URL=${SITE_URL}
 SESSION_SECRET=${SESSION_SECRET}
@@ -399,7 +501,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${APP_DIR}
-ExecStart=$(command -v node) ${APP_DIR}/src/server.js
+ExecStart=${NODE_BIN} ${APP_DIR}/src/server.js
 Restart=on-failure
 RestartSec=5s
 # server.js closes the listener on SIGTERM, which systemd sends by default.
