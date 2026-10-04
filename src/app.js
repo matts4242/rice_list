@@ -41,7 +41,7 @@ function applyFallbackLocals(res) {
   if (!locals.flagReasons) locals.flagReasons = flagsModel.REASONS;
   if (locals.isAdmin === undefined) locals.isAdmin = false;
   if (locals.flash === undefined) locals.flash = null;
-  if (!locals.csrfToken) locals.csrfToken = '';
+  if (!locals.csrfToken) locals.csrfToken = () => '';
   if (!locals.format) locals.format = format;
 }
 
@@ -85,6 +85,11 @@ function createApp() {
     },
   }));
 
+  // Ahead of the session and the per-request locals: uptime monitors and
+  // redeploy.sh poll this constantly, and it needs neither a session nor the
+  // category query.
+  app.get('/health', (req, res) => res.json({ ok: true }));
+
   app.use(
     session({
       store: new SqliteStore({
@@ -93,7 +98,9 @@ function createApp() {
       }),
       secret: config.sessionSecret,
       resave: false,
-      saveUninitialized: true,
+      // A session is stored only once something is put in it: a CSRF token
+      // for a rendered form, a flash message, an admin sign-in.
+      saveUninitialized: false,
       name: 'ricelist.sid',
       cookie: {
         httpOnly: true,
@@ -128,8 +135,6 @@ function createApp() {
   app.use('/', require('./routes/listings'));
   app.use('/', require('./routes/messages'));
   app.use('/admin', require('./routes/admin'));
-
-  app.get('/health', (req, res) => res.json({ ok: true }));
 
   app.use((req, res) => {
     applyFallbackLocals(res);

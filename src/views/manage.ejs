@@ -63,7 +63,7 @@
 
     <form method="post" action="/listing/<%= listing.public_id %>/manage"
           enctype="multipart/form-data" class="stack" novalidate>
-      <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+      <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
       <input type="hidden" name="token" value="<%= manageToken %>">
 
       <%- include('partials/listing-form', { values: formValues, errors: errors, categories: categories, limits: limits }) %>
@@ -92,14 +92,14 @@
     <h2>Other actions</h2>
     <div class="action-row">
       <form method="post" action="/listing/<%= listing.public_id %>/renew" class="inline-form">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <input type="hidden" name="token" value="<%= manageToken %>">
         <button class="btn btn-ghost" type="submit">Renew for another period</button>
       </form>
 
       <form method="post" action="/listing/<%= listing.public_id %>/delete" class="inline-form"
             onsubmit="return confirm('Delete this ad permanently? This cannot be undone.');">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <input type="hidden" name="token" value="<%= manageToken %>">
         <button class="btn btn-danger" type="submit">Delete this ad</button>
       </form>

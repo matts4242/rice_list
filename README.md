@@ -76,10 +76,10 @@ seller's inbox rather than emailed.
 npm test
 ```
 
-72 tests covering validation and formatting, the posting and editing flows,
+76 tests covering validation and formatting, the posting and editing flows,
 search, manage-token authentication, contact messaging and relay failure,
-reporting and auto-hide, the moderation panel, image handling, expiry, and
-rate limiting.
+reporting and auto-hide, the moderation panel, image handling, expiry, rate
+limiting, and session creation.
 
 ## Layout
 

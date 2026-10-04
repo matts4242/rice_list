@@ -85,7 +85,7 @@
 
     <% if (listing.status === 'active') { %>
       <form method="post" action="/admin/listing/<%= listing.public_id %>/remove" class="stack">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <input type="hidden" name="return_to" value="listing">
         <div class="field">
           <label for="reason">Reason shown in the moderation log</label>
@@ -95,7 +95,7 @@
       </form>
     <% } else { %>
       <form method="post" action="/admin/listing/<%= listing.public_id %>/restore" class="inline-form">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <input type="hidden" name="return_to" value="listing">
         <button class="btn btn-primary" type="submit">Restore listing</button>
       </form>
@@ -103,14 +103,14 @@
 
     <div class="action-row">
       <form method="post" action="/admin/listing/<%= listing.public_id %>/dismiss-reports" class="inline-form">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <input type="hidden" name="return_to" value="listing">
         <button class="btn btn-ghost" type="submit">Dismiss open reports</button>
       </form>
 
       <form method="post" action="/admin/listing/<%= listing.public_id %>/delete" class="inline-form"
             onsubmit="return confirm('Permanently delete this listing and its images?');">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <button class="btn btn-danger" type="submit">Delete permanently</button>
       </form>
     </div>

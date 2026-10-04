@@ -371,6 +371,83 @@ test('admin search finds a listing whose title really contains a percent sign', 
 // lives in its own file: see tests/rate-limits.test.js.
 
 // ---------------------------------------------------------------------------
+// Sessions: traffic that never submits a form must not create one.
+// ---------------------------------------------------------------------------
+
+const sessionRows = () => getDb().prepare('SELECT count(*) AS n FROM sessions').get().n;
+
+test('health checks create no session and skip the per-request queries', async () => {
+  // Regression: every request minted a CSRF token into a fresh session and
+  // saveUninitialized persisted it, so an uptime monitor polling /health every
+  // few seconds wrote a session row per poll. /health also sat behind the
+  // middleware that loads the category list, so each poll queried for that too.
+  const realAllCategories = listingsModel.allCategories;
+  let categoryQueries = 0;
+  listingsModel.allCategories = (...args) => {
+    categoryQueries += 1;
+    return realAllCategories(...args);
+  };
+
+  try {
+    const before = sessionRows();
+    for (let i = 0; i < 10; i += 1) {
+      const response = await request(app).get('/health');
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body, { ok: true });
+      assert.equal(response.headers['set-cookie'], undefined, 'no session cookie');
+    }
+    assert.equal(sessionRows(), before, '/health must not write session rows');
+    assert.equal(categoryQueries, 0, '/health must not load the category list');
+  } finally {
+    listingsModel.allCategories = realAllCategories;
+  }
+});
+
+test('pages without a form create no session', async () => {
+  const before = sessionRows();
+  for (const url of ['/', '/?q=bicycle', '/?category=for-sale', '/no-such-page']) {
+    const response = await request(app).get(url);
+    assert.equal(response.headers['set-cookie'], undefined, `${url} set a cookie`);
+  }
+  assert.equal(sessionRows(), before, 'browsing must not write session rows');
+});
+
+test('a page with a form still starts a session its token is checked against', async () => {
+  const before = sessionRows();
+  const agent = request.agent(app);
+  const page = await agent.get('/admin/login');
+  assert.ok(page.headers['set-cookie'], 'a form page must issue a session cookie');
+  assert.equal(sessionRows(), before + 1);
+
+  // The token rendered into the form is the one the session now holds.
+  const forged = await agent
+    .post('/admin/login')
+    .type('form')
+    .send({ _csrf: 'not-the-token', password: ADMIN_PASSWORD });
+  assert.equal(forged.status, 403);
+
+  const csrf = await tokenFor(agent, '/admin/login');
+  const genuine = await agent
+    .post('/admin/login')
+    .type('form')
+    .send({ _csrf: csrf, password: ADMIN_PASSWORD });
+  assert.equal(genuine.status, 302);
+});
+
+test('a cross-site post without a session is refused and creates none', async () => {
+  const { publicId } = await createListing(request.agent(app));
+  const before = sessionRows();
+
+  const response = await request(app)
+    .post(`/listing/${publicId}/report`)
+    .type('form')
+    .send({ reason: 'spam' });
+
+  assert.equal(response.status, 403);
+  assert.equal(sessionRows(), before);
+});
+
+// ---------------------------------------------------------------------------
 // Bind address: the app must be able to hide behind the proxy.
 // ---------------------------------------------------------------------------
 

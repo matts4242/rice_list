@@ -14,7 +14,7 @@
     <% if (error) { %><div class="flash flash-error"><%= error %></div><% } %>
 
     <form method="post" action="/admin/login" class="stack">
-      <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+      <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
       <input type="hidden" name="next" value="<%= next %>">
       <div class="field">
         <label for="password">Password</label>
