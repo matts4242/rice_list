@@ -64,6 +64,11 @@ function createApp() {
           formAction: ["'self'"],
           frameAncestors: ["'none'"],
           objectSrc: ["'none'"],
+          // Production is HTTPS-only, so this costs nothing there. In
+          // development it rewrote every subresource and form to https://,
+          // breaking the site when opened over plain HTTP by LAN address.
+          // helmet drops a default directive set to null, not to [].
+          upgradeInsecureRequests: config.isProduction ? [] : null,
         },
       },
       // Uploaded images are served same-origin; the default COEP breaks

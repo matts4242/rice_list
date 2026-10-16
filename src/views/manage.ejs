@@ -100,7 +100,7 @@
       <% } %>
 
       <form method="post" action="/listing/<%= listing.public_id %>/delete" class="inline-form"
-            onsubmit="return confirm('Delete this ad permanently? This cannot be undone.');">
+            data-confirm="Delete this ad permanently? This cannot be undone.">
         <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <input type="hidden" name="token" value="<%= manageToken %>">
         <button class="btn btn-danger" type="submit">Delete this ad</button>

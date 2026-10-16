@@ -466,6 +466,47 @@ test('a cross-site post without a session is refused and creates none', async ()
 });
 
 // ---------------------------------------------------------------------------
+// Content Security Policy: nothing in the pages may depend on what it blocks.
+// ---------------------------------------------------------------------------
+
+test('no view relies on an inline event handler, which the CSP blocks', () => {
+  // Regression: both delete buttons used onsubmit="return confirm(...)", but
+  // script-src-attr 'none' stops inline handlers running, so one click
+  // deleted an ad, its photos and its messages with no confirmation.
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const viewsDir = path.join(__dirname, '..', 'src', 'views');
+  const views = fs.readdirSync(viewsDir, { recursive: true }).filter((file) => file.endsWith('.ejs'));
+  assert.ok(views.length > 10, 'expected to scan the views');
+
+  for (const file of views) {
+    const source = fs.readFileSync(path.join(viewsDir, file), 'utf8');
+    // Not anchored to "<": EJS tags inside an attribute contain ">" too.
+    assert.doesNotMatch(source, /\son[a-z]+\s*=\s*["']/i, `${file} has an inline event handler`);
+  }
+});
+
+test('destructive forms ask first, through the same-origin confirm script', async () => {
+  const agent = request.agent(app);
+  const { publicId, manageToken } = await createListing(agent);
+  const page = await agent.get(`/listing/${publicId}/manage?token=${manageToken}`);
+
+  assert.match(page.text, /<form[^>]+\/delete"[^>]*data-confirm="[^"]+"/);
+  assert.match(page.text, /<script src="\/static\/js\/confirm\.js"/);
+  const script = await request(app).get('/static/js/confirm.js');
+  assert.equal(script.status, 200);
+});
+
+test('outside production the CSP does not force every request onto HTTPS', async () => {
+  // Regression: upgrade-insecure-requests made the dev server unusable over
+  // plain HTTP from another device: CSS and every form went to https://.
+  const response = await request(app).get('/');
+  const csp = response.headers['content-security-policy'];
+  assert.match(csp, /script-src 'self'/);
+  assert.doesNotMatch(csp, /upgrade-insecure-requests/);
+});
+
+// ---------------------------------------------------------------------------
 // Bind address: the app must be able to hide behind the proxy.
 // ---------------------------------------------------------------------------
 

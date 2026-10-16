@@ -109,7 +109,7 @@
       </form>
 
       <form method="post" action="/admin/listing/<%= listing.public_id %>/delete" class="inline-form"
-            onsubmit="return confirm('Permanently delete this listing and its images?');">
+            data-confirm="Permanently delete this listing and its images?">
         <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
         <button class="btn btn-danger" type="submit">Delete permanently</button>
       </form>
