@@ -11,6 +11,8 @@ useTempEnvironment('rate-limits');
 // and pick a small edit allowance before anything reads the configuration.
 delete process.env.DISABLE_RATE_LIMIT;
 process.env.EDITS_PER_HOUR = '2';
+// Lets the tests below choose the client address the limiter sees.
+process.env.TRUST_PROXY = '1';
 
 const request = require('supertest');
 const { createApp } = require('../src/app');
@@ -80,4 +82,37 @@ test('posting is still throttled', async () => {
     statuses.includes(429),
     `posting should eventually be refused, got ${statuses.join(', ')}`
   );
+});
+
+/** Wrong-password sign-ins, each from the next address `addressFor` gives. */
+async function failedLogins(count, addressFor) {
+  const agent = request.agent(app);
+  const csrf = await tokenFor(agent, '/admin/login');
+  const statuses = [];
+  for (let i = 0; i < count; i += 1) {
+    const response = await agent
+      .post('/admin/login')
+      .set('X-Forwarded-For', addressFor(i))
+      .type('form')
+      .send({ _csrf: csrf, password: 'not the password' });
+    statuses.push(response.status);
+  }
+  return statuses;
+}
+
+test('rotating addresses inside one IPv6 prefix does not escape the login limit', async () => {
+  // Regression: limits were keyed on the full address, and an IPv6 host
+  // holds a /64 or more — an endless supply of fresh buckets for guessing
+  // the admin password.
+  const statuses = await failedLogins(12, (i) => `2001:db8:7:7::${(i + 1).toString(16)}`);
+  assert.ok(statuses.includes(429), `expected a 429, got ${statuses.join(', ')}`);
+});
+
+test('separate IPv4 clients keep separate login allowances', async () => {
+  // The flip side: masking must not lump every IPv4 client together, which a
+  // naive IPv6 mask does to IPv4-mapped addresses.
+  const first = await failedLogins(10, () => '192.0.2.10');
+  assert.ok(!first.includes(429), 'ten attempts are within the allowance');
+  const other = await failedLogins(1, () => '192.0.2.11');
+  assert.deepEqual(other, [401], 'a different client is not throttled');
 });

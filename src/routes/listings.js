@@ -284,11 +284,15 @@ router.post('/listing/:publicId/manage', editLimiter, handleUpload, loadManagedL
 });
 
 router.post('/listing/:publicId/renew', loadManagedListing, (req, res) => {
-  listings.renew(req.listing.id);
-  req.session.flash = {
-    type: 'success',
-    message: `Your ad is active again for another ${config.listings.expiryDays} days.`,
-  };
+  req.session.flash = listings.renew(req.listing.id)
+    ? {
+        type: 'success',
+        message: `Your ad is active again for another ${config.listings.expiryDays} days.`,
+      }
+    : {
+        type: 'error',
+        message: 'This ad was removed by a moderator, so it cannot be renewed.',
+      };
   res.redirect(`/listing/${req.listing.public_id}/manage?token=${encodeURIComponent(req.manageToken)}`);
 });
 

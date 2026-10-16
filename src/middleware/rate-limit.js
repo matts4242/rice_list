@@ -3,6 +3,7 @@
 const rateLimit = require('express-rate-limit');
 
 const config = require('../config');
+const { clientKey } = require('../lib/client-key');
 
 function limiter({ max, windowMs, message }) {
   return rateLimit({
@@ -10,6 +11,9 @@ function limiter({ max, windowMs, message }) {
     max,
     standardHeaders: true,
     legacyHeaders: false,
+    // The default key is the full address, which gives an IPv6 host one
+    // bucket per address in its /64 — an unlimited supply.
+    keyGenerator: (req) => clientKey(req.ip),
     // Tests and local development would otherwise trip limits constantly.
     skip: () => process.env.DISABLE_RATE_LIMIT === '1',
     handler(req, res, next) {

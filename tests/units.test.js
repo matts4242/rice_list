@@ -86,12 +86,12 @@ test('user text is escaped when rendered as HTML', () => {
   assert.equal(html.match(/<p>/g).length, 2);
 });
 
-test('passwords verify only against their own hash', () => {
+test('passwords verify only against their own hash', async () => {
   const hash = hashPassword('correct horse');
-  assert.equal(verifyPassword('correct horse', hash), true);
-  assert.equal(verifyPassword('wrong horse', hash), false);
-  assert.equal(verifyPassword('anything', 'not-a-hash'), false);
-  assert.equal(verifyPassword('anything', undefined), false);
+  assert.equal(await verifyPassword('correct horse', hash), true);
+  assert.equal(await verifyPassword('wrong horse', hash), false);
+  assert.equal(await verifyPassword('anything', 'not-a-hash'), false);
+  assert.equal(await verifyPassword('anything', undefined), false);
 });
 
 test('manage tokens are unguessable and compared by hash', () => {

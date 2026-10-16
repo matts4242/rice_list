@@ -97,7 +97,9 @@ router.post('/listing/:publicId/report', flagLimiter, loadActiveListing, (req, r
     return;
   }
 
-  flags.create(listing.id, { reason, note });
+  // A repeat report from the same reporter is dropped silently: telling them
+  // would only confirm the dedupe to someone trying to get round it.
+  flags.create(listing.id, { reason, note, reporterKey: flags.reporterKeyFor(req.ip) });
 
   req.session.flash = {
     type: 'success',

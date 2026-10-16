@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 
 const { useTempEnvironment, csrfFrom, tokenFor, validListing } = require('./helpers');
 useTempEnvironment('messaging');
+// Reports are counted per address; the auto-hide test reports from several.
+process.env.TRUST_PROXY = '1';
 
 const request = require('supertest');
 const { createApp } = require('../src/app');
@@ -174,9 +176,11 @@ test('enough reports auto-hide a listing from the public site', async () => {
   const page = await agent.get(`/listing/${publicId}/report`);
   const csrf = csrfFrom(page.text);
 
+  // Distinct reporters: one visitor reporting repeatedly counts once.
   for (let i = 0; i < 5; i += 1) {
     await agent
       .post(`/listing/${publicId}/report`)
+      .set('X-Forwarded-For', `192.0.2.${i + 1}`)
       .type('form')
       .send({ _csrf: csrf, reason: 'spam', note: `report ${i}` });
   }

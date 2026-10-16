@@ -250,14 +250,39 @@ function setStatus(listingId, status, reason = '') {
     .run(status, reason, listingId);
 }
 
+/**
+ * Extend a listing for another period. Only the stored status gates this:
+ * 'active' covers both a live ad and one that has lapsed but not yet been
+ * swept. A removed ad — by a moderator, or auto-hidden by reports — is not
+ * the owner's to bring back, so it is left alone and false is returned.
+ */
 function renew(listingId) {
-  getDb()
+  const { changes } = getDb()
     .prepare(
       `UPDATE listings
           SET status = 'active', expires_at = datetime('now', ?), updated_at = datetime('now')
-        WHERE id = ?`
+        WHERE id = ? AND status IN ('active', 'expired')`
     )
     .run(`+${config.listings.expiryDays} days`, listingId);
+  return changes > 0;
+}
+
+/**
+ * A moderator's restore. A listing that lapsed while it was removed, or was
+ * already expired, gets a fresh period: otherwise "restored" would leave it
+ * just as unavailable as before.
+ */
+function restore(listingId) {
+  getDb()
+    .prepare(
+      `UPDATE listings
+          SET status = 'active', removed_reason = '',
+              expires_at = CASE WHEN expires_at <= datetime('now')
+                                THEN datetime('now', @expiry) ELSE expires_at END,
+              updated_at = datetime('now')
+        WHERE id = @id`
+    )
+    .run({ id: listingId, expiry: `+${config.listings.expiryDays} days` });
 }
 
 function remove(listingId) {
@@ -306,9 +331,11 @@ module.exports = {
   update,
   setStatus,
   renew,
+  restore,
   remove,
   authenticateManageToken,
   replaceImages,
   imagesFor,
   toFtsQuery,
+  EFFECTIVE_STATUS,
 };
