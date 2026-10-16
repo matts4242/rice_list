@@ -3,7 +3,10 @@
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-require('dotenv').config();
+// Not under test: dotenv fills in anything the environment lacks, so a
+// developer's own .env — a real SMTP server, an admin password hash, their
+// limits — would leak into the suite and change what it tests.
+if (process.env.NODE_ENV !== 'test') require('dotenv').config();
 
 const rootDir = path.join(__dirname, '..');
 

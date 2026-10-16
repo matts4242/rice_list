@@ -35,12 +35,15 @@ function isEmail(value) {
  * Returns { ok, cents } where cents === null means "contact for price".
  */
 function parsePrice(raw) {
-  const value = text(raw).replace(/[$,\s]/g, '');
+  const value = text(raw).replace(/[$\s]/g, '');
   if (value === '') return { ok: true, cents: null };
-  if (!/^\d+(\.\d{1,2})?$/.test(value)) {
+  // Commas only as thousands separators, in groups of three. Anything else
+  // is a decimal comma ("39,99"), and silently dropping it would list the
+  // item at a hundred times its price.
+  if (!/^(\d{1,3}(,\d{3})+|\d+)(\.\d{1,2})?$/.test(value)) {
     return { ok: false, error: 'Price must be a number like 40 or 39.99.' };
   }
-  const cents = Math.round(Number(value) * 100);
+  const cents = Math.round(Number(value.replace(/,/g, '')) * 100);
   if (!Number.isSafeInteger(cents) || cents > LIMITS.maxPriceCents) {
     return { ok: false, error: 'Price is too large.' };
   }
