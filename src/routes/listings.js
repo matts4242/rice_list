@@ -22,10 +22,24 @@ const imageUpload = upload.array('images', config.listings.maxImages);
  * the app, so folding the deferred CSRF check in here means an upload route
  * cannot accidentally skip it.
  */
+// Limits on the form's text parts. Parsing stopped partway, so the body is
+// incomplete and there is no form worth re-rendering: no listing form comes
+// near these, only hand-built requests do.
+const FORM_LIMIT_CODES = new Set([
+  'LIMIT_FIELD_COUNT',
+  'LIMIT_FIELD_KEY',
+  'LIMIT_FIELD_VALUE',
+  'LIMIT_PART_COUNT',
+]);
+
 function handleUpload(req, res, next) {
   imageUpload(req, res, (err) => {
     if (!err) {
       verifyCsrf(req, res, next);
+      return;
+    }
+    if (err instanceof multer.MulterError && FORM_LIMIT_CODES.has(err.code)) {
+      next(Object.assign(new Error('That form submission was too large.'), { status: 413, expose: true }));
       return;
     }
     if (err instanceof multer.MulterError) {
@@ -38,9 +52,16 @@ function handleUpload(req, res, next) {
       verifyCsrf(req, res, next);
       return;
     }
-    next(err);
+    // Anything else out of the parser is a body that is not valid multipart:
+    // the client's fault, so a 400 rather than a 500 and a logged stack trace.
+    next(Object.assign(new Error('That upload could not be read. Please try again.'), {
+      status: 400,
+      expose: true,
+    }));
   });
 }
+
+const UNREADABLE_IMAGE = 'One of those images could not be read. Try a different file.';
 
 function pageNumber(raw) {
   const page = Number.parseInt(raw, 10);
@@ -106,11 +127,11 @@ router.post('/post', postLimiter, handleUpload, async (req, res, next) => {
   let filenames = [];
   try {
     filenames = await processImages(req.files);
-  } catch {
+  } catch (error) {
     res.status(400).render('post', {
       title: 'Post an ad',
       values,
-      errors: { images: 'One of those images could not be read. Try a different file.' },
+      errors: { images: error.userMessage || UNREADABLE_IMAGE },
     });
     return;
   }
@@ -232,16 +253,21 @@ function loadManagedListing(req, res, next) {
   next();
 }
 
-router.get('/listing/:publicId/manage', loadManagedListing, (req, res) => {
-  res.render('manage', {
+/** The manage page; `values` are a failed edit's input, null to show the record. */
+function renderManage(req, res, { status = 200, values = null, errors = {} } = {}) {
+  res.status(status).render('manage', {
     title: `Manage "${req.listing.title}"`,
     listing: req.listing,
     manageToken: req.manageToken,
     inbox: messages.forListing(req.listing.id),
-    values: null,
-    errors: {},
+    values,
+    errors,
     thumbFor,
   });
+}
+
+router.get('/listing/:publicId/manage', loadManagedListing, (req, res) => {
+  renderManage(req, res);
 });
 
 // The limiter runs before handleUpload on purpose: multer buffers the whole
@@ -255,30 +281,40 @@ router.post('/listing/:publicId/manage', editLimiter, handleUpload, loadManagedL
   if (req.uploadError) errors.images = req.uploadError;
 
   if (!ok || errors.images) {
-    res.status(400).render('manage', {
-      title: `Manage "${req.listing.title}"`,
-      listing: req.listing,
-      manageToken: req.manageToken,
-      inbox: messages.forListing(req.listing.id),
-      values,
-      errors,
-      thumbFor,
-    });
+    renderManage(req, res, { status: 400, values, errors });
     return;
   }
 
-  try {
-    listings.update(req.listing.id, values);
-
-    if (req.files && req.files.length > 0) {
-      const filenames = await processImages(req.files);
-      const previous = listings.imagesFor(req.listing.id).map((row) => row.filename);
-      listings.replaceImages(req.listing.id, filenames);
-      await deleteImages(previous);
+  // Images first: a photo that will not decode is the poster's to fix, and
+  // must not leave the text half-saved behind a 500.
+  let filenames = null;
+  if (req.files && req.files.length > 0) {
+    try {
+      filenames = await processImages(req.files);
+    } catch (error) {
+      renderManage(req, res, {
+        status: 400,
+        values,
+        errors: { images: error.userMessage || UNREADABLE_IMAGE },
+      });
+      return;
     }
+  }
+
+  const previous = filenames ? listings.imagesFor(req.listing.id).map((row) => row.filename) : [];
+  try {
+    listings.update(req.listing.id, values, filenames);
   } catch (error) {
+    if (filenames) await deleteImages(filenames);
     next(error);
     return;
+  }
+
+  // Only once the swap has committed are the old files unreferenced.
+  try {
+    await deleteImages(previous);
+  } catch (error) {
+    console.error('Failed to remove replaced images:', error.message);
   }
 
   req.session.flash = { type: 'success', message: 'Your ad has been updated.' };

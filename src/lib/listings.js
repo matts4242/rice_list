@@ -232,11 +232,23 @@ function create(values, imageFilenames = []) {
   return { listing: byPublicId(publicId), manageToken };
 }
 
-function update(listingId, values) {
+/**
+ * Save an edit. With `imageFilenames`, the listing's images are replaced in
+ * the same transaction, so text and photos change together or not at all.
+ */
+function update(listingId, values, imageFilenames = null) {
   const category = categoryBySlug(values.category);
   if (!category) throw new Error(`Unknown category: ${values.category}`);
 
-  getDb()
+  const db = getDb();
+  db.transaction(() => {
+    updateText(db, listingId, category, values);
+    if (imageFilenames) replaceImages(listingId, imageFilenames);
+  })();
+}
+
+function updateText(db, listingId, category, values) {
+  db
     .prepare(
       `UPDATE listings
           SET title = @title, description = @description, price_cents = @priceCents,
