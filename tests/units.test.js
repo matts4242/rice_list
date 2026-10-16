@@ -108,3 +108,22 @@ test('search queries survive punctuation users actually type', () => {
   assert.equal(toFtsQuery('!!!'), null);
   assert.equal(toFtsQuery(''), null);
 });
+
+test('search queries are bounded however long the input', () => {
+  // Regression: every term became another ANDed FTS lookup, so "a a a …"
+  // eight thousand times held the event loop for seconds per request.
+  assert.equal(toFtsQuery('a '.repeat(8000)), '"a"*');
+
+  const distinct = Array.from({ length: 50 }, (_, i) => `word${i}`).join(' ');
+  const terms = toFtsQuery(distinct).split(' AND ');
+  assert.equal(terms.length, 8);
+  assert.equal(terms.at(-1), '"word7"*', 'the prefix match goes on the last term kept');
+});
+
+test('search terms keep their accents and dotted capitals intact', () => {
+  // Regression: lowercasing turned "İ" into "i" plus a combining dot, and
+  // splitting on combining marks then broke the word in two.
+  assert.equal(toFtsQuery('İstanbul'), '"İstanbul"*');
+  assert.equal(toFtsQuery('naïve'), '"naïve"*', 'decomposed input is composed');
+  assert.equal(toFtsQuery('bike ́'), '"bike"*', 'a stray mark is not a term');
+});

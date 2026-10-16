@@ -192,6 +192,24 @@ test('viewing a listing does not rewrite its search index rows', async () => {
   assert.match(search.text, /Unmistakable kayak/);
 });
 
+test('search finds words with dotted capitals and decomposed accents', async () => {
+  // Regression: "İstanbul" (the normal Turkish spelling) and NFD-encoded
+  // accents found nothing, because the query was lowercased and split on
+  // combining marks before it reached FTS.
+  await createListing(request.agent(app), {
+    title: 'Bisiklet satılık in good order',
+    location: 'İstanbul',
+  });
+  await createListing(request.agent(app), { title: 'Naïve folk art café chair' });
+
+  for (const q of ['İstanbul', 'İSTANBUL', 'istanbul']) {
+    const response = await request(app).get(`/?q=${encodeURIComponent(q)}`);
+    assert.match(response.text, /Bisiklet satılık/, `q=${q}`);
+  }
+  const decomposed = await request(app).get(`/?q=${encodeURIComponent('naïve')}`);
+  assert.match(decomposed.text, /Naïve folk art/);
+});
+
 test('editing a listing still updates its search index', async () => {
   const agent = request.agent(app);
   const { publicId, manageToken } = await createListing(agent, {

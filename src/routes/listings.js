@@ -50,7 +50,9 @@ function pageNumber(raw) {
 router.get('/', (req, res) => {
   expireStaleListings();
 
-  const search = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  // Trimmed to what toFtsQuery will consider, so the box shows what was searched.
+  const search =
+    typeof req.query.q === 'string' ? req.query.q.trim().slice(0, listings.MAX_SEARCH_LENGTH) : '';
   const categorySlug =
     typeof req.query.category === 'string' && req.query.category
       ? req.query.category

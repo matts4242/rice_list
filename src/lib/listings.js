@@ -54,15 +54,33 @@ function attachImages(listings) {
   return listings;
 }
 
+// The work one search may ask of FTS. Every term is ANDed in and costs a pass
+// over its matches, so an unbounded query — "a a a …" eight thousand times —
+// stalls the process for seconds. Past a few terms results only narrow.
+const MAX_SEARCH_LENGTH = 200;
+const MAX_SEARCH_TERMS = 8;
+
 /**
  * FTS5 treats plenty of punctuation as syntax. Users type search boxes, not
  * query languages, so quote each term and prefix-match the last one.
+ *
+ * Case is left to the unicode61 tokenizer, which folds it the same way for
+ * the index and the query; lowercasing here instead turned "İstanbul" into
+ * "i̇stanbul", whose combining dot then split the word. Combining marks stay
+ * inside terms, and input is NFC-normalised, so decomposed accents match too.
  */
 function toFtsQuery(search) {
-  const terms = String(search)
-    .toLowerCase()
-    .split(/[^\p{L}\p{N}]+/u)
-    .filter(Boolean);
+  const terms = [
+    ...new Set(
+      String(search)
+        .slice(0, MAX_SEARCH_LENGTH)
+        .normalize('NFC')
+        .split(/[^\p{L}\p{M}\p{N}]+/u)
+        // A term that is only stray combining marks would match nothing and,
+        // ANDed in, empty the whole result.
+        .filter((term) => /[\p{L}\p{N}]/u.test(term))
+    ),
+  ].slice(0, MAX_SEARCH_TERMS);
   if (terms.length === 0) return null;
   return terms.map((term, i) => {
     const quoted = `"${term.replace(/"/g, '')}"`;
@@ -338,4 +356,5 @@ module.exports = {
   imagesFor,
   toFtsQuery,
   EFFECTIVE_STATUS,
+  MAX_SEARCH_LENGTH,
 };
