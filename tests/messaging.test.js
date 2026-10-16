@@ -109,6 +109,58 @@ test('a message is kept even when the email relay fails', async () => {
   }
 });
 
+/** A relay that accepts the message and never answers. */
+function useStalledRelay() {
+  mailer._setTransportForTests({ sendMail: () => new Promise(() => {}) });
+  mailer._setDeadlineForTests(300);
+  return () => {
+    mailer._setTransportForTests(null);
+    mailer._setDeadlineForTests(20_000);
+  };
+}
+
+test('a stalled relay cannot hold a buyer\'s request open', async () => {
+  // Regression: the send was awaited with nodemailer's default timeouts
+  // (minutes), so a relay that stopped answering held the request past the
+  // proxy's 60 s limit and the buyer got a gateway error.
+  const agent = request.agent(app);
+  const { publicId, manageToken } = await createListing(agent);
+  const restore = useStalledRelay();
+
+  try {
+    const started = Date.now();
+    const response = await sendMessage(agent, publicId, { sender_name: 'Patient Buyer' });
+    assert.equal(response.status, 302);
+    assert.ok(Date.now() - started < 5000, 'the deadline should end the wait');
+
+    const inbox = await agent.get(`/listing/${publicId}/manage?token=${manageToken}`);
+    assert.match(inbox.text, /Patient Buyer/);
+    assert.match(inbox.text, /Not delivered by email/);
+  } finally {
+    restore();
+  }
+});
+
+test('a stalled relay cannot cost a poster their manage link', async () => {
+  const restore = useStalledRelay();
+  try {
+    const agent = request.agent(app);
+    const csrf = await tokenFor(agent, '/post');
+    const response = await agent.post('/post').type('form').send({ _csrf: csrf, ...validListing() });
+
+    assert.equal(response.status, 302);
+    assert.match(response.headers.location, /\/posted\?token=[^&]+&emailed=0$/);
+  } finally {
+    restore();
+  }
+});
+
+test('the relay is given timeouts far shorter than the proxy\'s', () => {
+  for (const [name, ms] of Object.entries(mailer.SMTP_TIMEOUTS)) {
+    assert.ok(ms <= 15_000, `${name} is ${ms} ms`);
+  }
+});
+
 test('a relayed message is addressed to the seller with the buyer as reply-to', async () => {
   const agent = request.agent(app);
   const { publicId } = await createListing(agent, { contact_email: 'seller@example.com' });
