@@ -84,8 +84,9 @@ Options:
                          Same, given inline.
   --harden-ssh           Disable root login and password authentication.
                          Refuses unless an authorised key is already in place.
-  --swap SIZE            Swap file size, e.g. 2G. Default: 2G when the machine
-                         has under 2 GB of RAM and no swap, otherwise none.
+  --swap SIZE            Swap file size, e.g. 2G or 512M. Default: 2G when the
+                         machine has under 2 GB of RAM and no swap, otherwise
+                         none. Shrunk or skipped to keep 1 GB of disk free.
   --web-ports LIST       Ports to open for the site. (default: 80,443)
   --no-firewall          Do not configure or enable ufw.
   --no-fail2ban          Do not install fail2ban.
@@ -159,6 +160,15 @@ if [ -n "$ADMIN_USER" ]; then
   case "$ADMIN_USER" in
     *[!a-z0-9_-]*|-*|"") die "--admin-user must be a plain lowercase name." ;;
   esac
+fi
+
+# Swap is sized in whole MB or GB so it can be checked against free space.
+SWAP_MB=""
+if [ -n "$SWAP_SIZE" ]; then
+  [[ "$SWAP_SIZE" =~ ^([1-9][0-9]*)([MmGg])$ ]] \
+    || die "--swap takes a size like 512M or 2G, not '$SWAP_SIZE'."
+  SWAP_MB="${BASH_REMATCH[1]}"
+  case "${BASH_REMATCH[2]}" in [Gg]) SWAP_MB=$(( SWAP_MB * 1024 )) ;; esac
 fi
 
 # The effective sshd port, not whatever the config file happens to say: an
@@ -252,35 +262,85 @@ mem_mb=$(( mem_kb / 1024 ))
 swap_kb="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
 info "RAM: ${mem_mb} MB, swap: $(( swap_kb / 1024 )) MB"
 
-want_swap="$SWAP_SIZE"
-if [ -z "$want_swap" ] && [ "$swap_kb" -eq 0 ] && [ "$mem_mb" -lt 2048 ]; then
+want_mb="$SWAP_MB"
+if [ -z "$want_mb" ] && [ "$swap_kb" -eq 0 ] && [ "$mem_mb" -lt 2048 ]; then
   # sharp re-encodes uploads in memory and npm's native builds are hungry;
   # on a 1 GB box either can be killed by the OOM reaper without swap.
-  want_swap="2G"
-  info "Small machine with no swap; adding ${want_swap}."
+  want_mb=2048
+  info "Small machine with no swap; adding 2G."
 fi
 
-if [ -n "$want_swap" ] && [ "$swap_kb" -gt 0 ]; then
-  info "Swap already active; leaving it alone."
-elif [ -n "$want_swap" ]; then
-  if [ -e /swapfile ]; then
-    warn "/swapfile already exists but is not in use; leaving it alone."
+swapfile_active() { awk 'NR > 1 && $1 == "/swapfile" { found = 1 } END { exit !found }' /proc/swaps; }
+swapfile_in_fstab() { grep -qs '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; }
+
+make_swapfile() {
+  local mb="$1"
+  if [ "$(stat -f -c %T /)" = "btrfs" ]; then
+    # swapon rejects a fallocated file on btrfs, which is copy-on-write;
+    # this makes the no-COW file it accepts, already formatted as swap.
+    run btrfs filesystem mkswapfile --size "${mb}m" /swapfile || return 1
   else
-    run fallocate -l "$want_swap" /swapfile
-    run chmod 600 /swapfile
-    run mkswap /swapfile
-    run swapon /swapfile
-    if ! grep -qs '^/swapfile ' /etc/fstab; then
-      if [ "$DRY_RUN" = "yes" ]; then
-        info "[dry-run] append '/swapfile none swap sw 0 0' to /etc/fstab"
-      else
-        printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
-      fi
-    fi
-    ok "Added ${want_swap} of swap"
+    run fallocate -l "${mb}M" /swapfile || return 1
+    run chmod 600 /swapfile || return 1
+    run mkswap /swapfile || return 1
   fi
-else
+  run swapon /swapfile
+}
+
+add_swap() {
+  local mb="$1" avail_mb room_mb reclaim_mb=0
+  if [ -e /swapfile ]; then
+    # Not in use and not in fstab: debris from an earlier attempt that died
+    # part-way, quite possibly the very file that filled the disk.
+    reclaim_mb="$(du -m /swapfile | cut -f1)"
+    info "/swapfile is left over from an earlier attempt that failed; replacing it."
+    run rm -f /swapfile
+    [ "$DRY_RUN" = "yes" ] || reclaim_mb=0
+  fi
+
+  # A full root filesystem breaks apt, journald, install.sh and SQLite all
+  # at once, which is far worse than no swap. Keep 1 GB of it free.
+  avail_mb=$(( $(df -m --output=avail / | tail -n 1) + reclaim_mb ))
+  room_mb=$(( avail_mb - 1024 ))
+  if [ "$room_mb" -lt "$mb" ]; then
+    if [ "$room_mb" -lt 256 ]; then
+      warn "Only ${avail_mb} MB free on /; adding no swap, to keep 1 GB free."
+      return 0
+    fi
+    warn "Only ${avail_mb} MB free on /; adding ${room_mb} MB of swap instead, to keep 1 GB free."
+    mb="$room_mb"
+  fi
+
+  # Any step can fail part-way: fallocate stops at ENOSPC still holding the
+  # space it got, and swapon refuses files it cannot use (ZFS, containers).
+  # Delete the file again before anything refers to it, so a failure never
+  # leaves it eating the disk. It is not in use and not in fstab, so this
+  # can never remove live swap.
+  if ! make_swapfile "$mb"; then
+    swapfile_active || rm -f /swapfile
+    warn "Could not set up swap; removed /swapfile again and carrying on without it."
+    return 0
+  fi
+  if ! grep -qs '^/swapfile ' /etc/fstab; then
+    if [ "$DRY_RUN" = "yes" ]; then
+      info "[dry-run] append '/swapfile none swap sw 0 0' to /etc/fstab"
+    else
+      printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+    fi
+  fi
+  ok "Added ${mb} MB of swap"
+}
+
+if [ -z "$want_mb" ]; then
   ok "Swap is fine as it is"
+elif [ "$swap_kb" -gt 0 ]; then
+  info "Swap already active; leaving it alone."
+elif [ -L /swapfile ] || { [ -e /swapfile ] && [ ! -f /swapfile ]; }; then
+  warn "/swapfile exists but is not a plain file; leaving it alone."
+elif [ -e /swapfile ] && { swapfile_active || swapfile_in_fstab; }; then
+  warn "/swapfile is listed in /etc/fstab but not in use; leaving it alone."
+else
+  add_swap "$want_mb"
 fi
 
 # --- Admin user -------------------------------------------------------------
