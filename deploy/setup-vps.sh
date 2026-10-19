@@ -174,15 +174,60 @@ ok "Preflight checks passed"
 
 step "Updating the system"
 export DEBIAN_FRONTEND=noninteractive
-run apt-get update -qq
+
+# A VPS booted a few minutes ago is usually still running apt-daily and
+# unattended-upgrades, which hold apt's locks for minutes at a time, and
+# apt-get gives up the moment it meets a held lock. DPkg::Lock::Timeout makes
+# install and upgrade wait for the dpkg lock instead. It does not cover the
+# package-lists lock that apt-get update takes (as of apt 2.8), so update is
+# retried while that lock is busy -- and only then: any other failure, a
+# broken sources.list say, stops the run at once rather than ten minutes on.
+apt_get() {
+  run apt-get -o DPkg::Lock::Timeout=600 "$@"
+}
+
+apt_update() {
+  local out tries=0
+  if [ "$DRY_RUN" = "yes" ]; then
+    run apt-get update -qq
+    return 0
+  fi
+  until out="$(LC_ALL=C apt-get update -qq 2>&1)"; do
+    case "$out" in
+      *"Could not get lock"*) ;;
+      *) printf '%s\n' "$out" >&2; return 1 ;;
+    esac
+    tries=$(( tries + 1 ))
+    if [ "$tries" -ge 60 ]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+    if [ "$tries" -eq 1 ]; then
+      info "apt is busy (on a new VPS, usually its own first update); waiting up to 10 minutes."
+    fi
+    sleep 10
+  done
+  if [ -n "$out" ]; then printf '%s\n' "$out" >&2; fi
+}
+
+apt_update || die "apt-get update failed; see the messages above."
 if [ "$SKIP_UPGRADE" = "no" ]; then
-  run apt-get -y -qq -o Dpkg::Options::=--force-confold upgrade
+  apt_get -y -qq -o Dpkg::Options::=--force-confold upgrade
   ok "Packages upgraded"
 else
   info "Skipping upgrade (--no-upgrade)"
 fi
-run apt-get install -y -qq ca-certificates curl gnupg git
-ok "Base tools present"
+
+# Everything the later steps need is installed here, before any account, SSH
+# or firewall change. A package that fails to install then stops the run
+# while nothing is half-configured -- not with SSH already hardened and the
+# firewall and fail2ban still missing.
+packages=(ca-certificates curl gnupg git)
+if [ "$SKIP_FIREWALL" = "no" ]; then packages+=(ufw); fi
+if [ "$SKIP_FAIL2BAN" = "no" ]; then packages+=(fail2ban); fi
+if [ "$SKIP_AUTO_UPDATES" = "no" ]; then packages+=(unattended-upgrades); fi
+apt_get install -y -qq "${packages[@]}"
+ok "Packages present: ${packages[*]}"
 
 # --- Identity ---------------------------------------------------------------
 
@@ -350,7 +395,6 @@ fi
 
 if [ "$SKIP_FIREWALL" = "no" ]; then
   step "Configuring the firewall"
-  run apt-get install -y -qq ufw
 
   # SSH first, always. Enabling ufw with no SSH rule ends the session and the
   # machine is then only reachable through the provider's console.
@@ -382,8 +426,7 @@ fi
 # --- fail2ban ---------------------------------------------------------------
 
 if [ "$SKIP_FAIL2BAN" = "no" ]; then
-  step "Installing fail2ban"
-  run apt-get install -y -qq fail2ban
+  step "Configuring fail2ban"
 
   write_file /etc/fail2ban/jail.d/ricelist.local 0644 <<JAIL
 # Written by deploy/setup-vps.sh.
@@ -408,7 +451,6 @@ fi
 
 if [ "$SKIP_AUTO_UPDATES" = "no" ]; then
   step "Enabling automatic security updates"
-  run apt-get install -y -qq unattended-upgrades
 
   write_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'AUTOUP'
 APT::Periodic::Update-Package-Lists "1";
