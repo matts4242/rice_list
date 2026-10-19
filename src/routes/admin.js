@@ -19,7 +19,7 @@ const router = express.Router();
  * Accept either a scrypt hash (preferred) or a plaintext password from the
  * environment, so a first run needs no hashing step.
  */
-function passwordIsValid(candidate) {
+async function passwordIsValid(candidate) {
   if (config.admin.passwordHash) {
     return verifyPassword(candidate, config.admin.passwordHash);
   }
@@ -67,7 +67,7 @@ router.get('/login', (req, res) => {
   });
 });
 
-router.post('/login', loginLimiter, (req, res) => {
+router.post('/login', loginLimiter, async (req, res) => {
   const nextPath = safeNext(req.body.next);
 
   if (!adminIsConfigured()) {
@@ -80,7 +80,7 @@ router.post('/login', loginLimiter, (req, res) => {
     return;
   }
 
-  if (!passwordIsValid(String(req.body.password || ''))) {
+  if (!(await passwordIsValid(String(req.body.password || '')))) {
     res.status(401).render('admin/login', {
       title: 'Admin login',
       configured: true,
@@ -172,7 +172,7 @@ router.post('/listing/:publicId/remove', loadListing, (req, res) => {
 });
 
 router.post('/listing/:publicId/restore', loadListing, (req, res) => {
-  listings.setStatus(req.listing.id, 'active', '');
+  listings.restore(req.listing.id);
   flags.resolveForListing(req.listing.id);
   req.session.flash = { type: 'success', message: `"${req.listing.title}" was restored.` };
   res.redirect(req.body.return_to === 'listing' ? `/admin/listing/${req.listing.public_id}` : '/admin');

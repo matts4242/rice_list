@@ -25,6 +25,40 @@ test('parsePrice treats a blank price as "contact for price"', () => {
   assert.deepEqual(parsePrice(undefined), { ok: true, cents: null });
 });
 
+test('parsePrice refuses a decimal comma rather than misreading it', () => {
+  // Regression: commas were stripped wholesale, so "39,99" was listed as
+  // $3,999.00 and "1,5" as $15.00.
+  assert.equal(parsePrice('39,99').ok, false);
+  assert.equal(parsePrice('1,5').ok, false);
+  assert.equal(parsePrice('1,2345').ok, false);
+  assert.equal(parsePrice(',').ok, false);
+  assert.deepEqual(parsePrice('1,500'), { ok: true, cents: 150000 });
+  assert.deepEqual(parsePrice('12,345,678.90'), { ok: true, cents: 1234567890 });
+});
+
+test('a developer\'s own .env does not leak into the test environment', () => {
+  // Regression: dotenv loaded ./.env during tests, so after the README's
+  // setup the suite failed, and could send mail through a real SMTP server.
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { execFileSync } = require('node:child_process');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rice-list-dotenv-'));
+  fs.writeFileSync(path.join(dir, '.env'), 'SMTP_HOST=smtp.real.example\nPOSTS_PER_HOUR=999\n');
+  const configPath = path.join(__dirname, '..', 'src', 'config');
+  const env = { ...process.env, NODE_ENV: 'test' };
+  delete env.SMTP_HOST;
+  delete env.POSTS_PER_HOUR;
+
+  const seen = execFileSync(
+    process.execPath,
+    ['-e', `const c = require(${JSON.stringify(configPath)}); console.log(JSON.stringify([c.smtp.host, c.listings.postsPerHour]))`],
+    { cwd: dir, env, encoding: 'utf8' }
+  );
+  assert.deepEqual(JSON.parse(seen), ['', 5]);
+});
+
 test('parsePrice rejects nonsense and out-of-range values', () => {
   assert.equal(parsePrice('abc').ok, false);
   assert.equal(parsePrice('12.345').ok, false);
@@ -86,12 +120,12 @@ test('user text is escaped when rendered as HTML', () => {
   assert.equal(html.match(/<p>/g).length, 2);
 });
 
-test('passwords verify only against their own hash', () => {
+test('passwords verify only against their own hash', async () => {
   const hash = hashPassword('correct horse');
-  assert.equal(verifyPassword('correct horse', hash), true);
-  assert.equal(verifyPassword('wrong horse', hash), false);
-  assert.equal(verifyPassword('anything', 'not-a-hash'), false);
-  assert.equal(verifyPassword('anything', undefined), false);
+  assert.equal(await verifyPassword('correct horse', hash), true);
+  assert.equal(await verifyPassword('wrong horse', hash), false);
+  assert.equal(await verifyPassword('anything', 'not-a-hash'), false);
+  assert.equal(await verifyPassword('anything', undefined), false);
 });
 
 test('manage tokens are unguessable and compared by hash', () => {
@@ -107,4 +141,23 @@ test('search queries survive punctuation users actually type', () => {
   assert.equal(toFtsQuery('  "quoted" -- junk!  '), '"quoted" AND "junk"*');
   assert.equal(toFtsQuery('!!!'), null);
   assert.equal(toFtsQuery(''), null);
+});
+
+test('search queries are bounded however long the input', () => {
+  // Regression: every term became another ANDed FTS lookup, so "a a a …"
+  // eight thousand times held the event loop for seconds per request.
+  assert.equal(toFtsQuery('a '.repeat(8000)), '"a"*');
+
+  const distinct = Array.from({ length: 50 }, (_, i) => `word${i}`).join(' ');
+  const terms = toFtsQuery(distinct).split(' AND ');
+  assert.equal(terms.length, 8);
+  assert.equal(terms.at(-1), '"word7"*', 'the prefix match goes on the last term kept');
+});
+
+test('search terms keep their accents and dotted capitals intact', () => {
+  // Regression: lowercasing turned "İ" into "i" plus a combining dot, and
+  // splitting on combining marks then broke the word in two.
+  assert.equal(toFtsQuery('İstanbul'), '"İstanbul"*');
+  assert.equal(toFtsQuery('naïve'), '"naïve"*', 'decomposed input is composed');
+  assert.equal(toFtsQuery('bike ́'), '"bike"*', 'a stray mark is not a term');
 });

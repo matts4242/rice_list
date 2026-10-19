@@ -23,6 +23,24 @@ function applySchema(connection) {
   connection.exec(schema);
 }
 
+/**
+ * schema.sql only creates what is missing, so a column added to an existing
+ * table needs an explicit step for databases created before it.
+ */
+function migrate(connection) {
+  const flagColumns = connection
+    .prepare('PRAGMA table_info(flags)')
+    .all()
+    .map((column) => column.name);
+  if (!flagColumns.includes('reporter_key')) {
+    connection.exec("ALTER TABLE flags ADD COLUMN reporter_key TEXT NOT NULL DEFAULT ''");
+  }
+  connection.exec(
+    `CREATE INDEX IF NOT EXISTS idx_flags_reporter
+       ON flags (listing_id, reporter_key) WHERE resolved = 0`
+  );
+}
+
 function seedCategories(connection) {
   const insert = connection.prepare(
     `INSERT INTO categories (slug, name, sort_order)
@@ -45,6 +63,7 @@ function getDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   applySchema(db);
+  migrate(db);
   seedCategories(db);
   return db;
 }

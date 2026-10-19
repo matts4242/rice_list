@@ -5,10 +5,14 @@ const assert = require('node:assert/strict');
 
 const { useTempEnvironment, csrfFrom, tokenFor, validListing } = require('./helpers');
 useTempEnvironment('moderation');
+// Auto-hide counts distinct reporters by address, so the tests below need to
+// report from several: trust X-Forwarded-For and give each report its own.
+process.env.TRUST_PROXY = '1';
 
 const request = require('supertest');
 const { createApp } = require('../src/app');
-const { closeDb } = require('../src/db');
+const { getDb, closeDb } = require('../src/db');
+const adminModel = require('../src/lib/admin');
 
 const app = createApp();
 const ADMIN_PASSWORD = 'test-admin-password';
@@ -36,13 +40,18 @@ async function signInAsAdmin() {
   return agent;
 }
 
-async function report(publicId, times = 1) {
+let nextReporter = 1;
+
+/** File reports from `times` different addresses, or all from `from`. */
+async function report(publicId, times = 1, { from } = {}) {
   const agent = request.agent(app);
   const page = await agent.get(`/listing/${publicId}/report`);
   const csrf = csrfFrom(page.text);
   for (let i = 0; i < times; i += 1) {
+    const address = from || `198.51.100.${nextReporter++}`;
     await agent
       .post(`/listing/${publicId}/report`)
+      .set('X-Forwarded-For', address)
       .type('form')
       .send({ _csrf: csrf, reason: 'spam', note: `report ${i}` });
   }
@@ -182,6 +191,156 @@ test('a moderator can permanently delete a listing', async () => {
 
   assert.equal((await request(app).get(`/listing/${publicId}`)).status, 404);
   assert.equal((await admin.get(`/admin/listing/${publicId}`)).status, 404);
+});
+
+// ---------------------------------------------------------------------------
+// Reports count people, not submissions.
+// ---------------------------------------------------------------------------
+
+test('one visitor reporting a listing repeatedly cannot hide it', async () => {
+  // Regression: every report counted, so one person could take down any ad
+  // by submitting the form five times.
+  const poster = request.agent(app);
+  const { publicId } = await createListing(poster, { title: 'Competitor bait listing' });
+
+  await report(publicId, 5, { from: '203.0.113.7' });
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 200);
+
+  const admin = await signInAsAdmin();
+  const detail = await admin.get(`/admin/listing/${publicId}`);
+  assert.match(detail.text, /Reports \(1\)/, 'repeats should not pile up in the queue');
+});
+
+test('addresses within one IPv6 prefix count as one reporter', async () => {
+  // An IPv6 host typically holds a whole /64 or more, so rotating addresses
+  // inside it must not manufacture distinct reporters.
+  const poster = request.agent(app);
+  const { publicId } = await createListing(poster);
+
+  for (let i = 1; i <= 5; i += 1) {
+    await report(publicId, 1, { from: `2001:db8:42:${i}::${i}` });
+  }
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 200);
+});
+
+// ---------------------------------------------------------------------------
+// Moderation must stick: the owner's manage link cannot undo it.
+// ---------------------------------------------------------------------------
+
+async function renewAsOwner(owner, publicId, manageToken) {
+  const managePath = `/listing/${publicId}/manage?token=${encodeURIComponent(manageToken)}`;
+  const page = await owner.get(managePath);
+  const response = await owner
+    .post(`/listing/${publicId}/renew`)
+    .type('form')
+    .send({ _csrf: csrfFrom(page.text), token: manageToken });
+  return { page, response };
+}
+
+test('a seller cannot renew away a moderator removal', async () => {
+  // Regression: renew set status = 'active' unconditionally, so the owner of
+  // a removed scam ad could put it straight back up.
+  const owner = request.agent(app);
+  const { publicId, manageToken } = await createListing(owner);
+
+  const admin = await signInAsAdmin();
+  const panel = await admin.get(`/admin/listing/${publicId}`);
+  await admin
+    .post(`/admin/listing/${publicId}/remove`)
+    .type('form')
+    .send({ _csrf: csrfFrom(panel.text), reason: 'Scam' });
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 410);
+
+  const { page, response } = await renewAsOwner(owner, publicId, manageToken);
+  assert.doesNotMatch(page.text, /Renew for another period/, 'no renew button on a removed ad');
+  assert.equal(response.status, 302);
+
+  const after = await owner.get(response.headers.location);
+  assert.match(after.text, /removed by a moderator, so it cannot be renewed/);
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 410);
+});
+
+test('an auto-hidden listing cannot be renewed back up by its owner', async () => {
+  const owner = request.agent(app);
+  const { publicId, manageToken } = await createListing(owner);
+
+  await report(publicId, 5);
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 410);
+
+  await renewAsOwner(owner, publicId, manageToken);
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 410);
+});
+
+test('renewing a live listing still extends it', async () => {
+  const owner = request.agent(app);
+  const { publicId, manageToken } = await createListing(owner);
+  const expiry = () =>
+    getDb().prepare('SELECT expires_at FROM listings WHERE public_id = ?').get(publicId).expires_at;
+
+  getDb()
+    .prepare("UPDATE listings SET expires_at = datetime('now', '+1 day') WHERE public_id = ?")
+    .run(publicId);
+  const before = expiry();
+
+  const { response } = await renewAsOwner(owner, publicId, manageToken);
+  assert.equal(response.status, 302);
+  assert.ok(expiry() > before, 'the expiry should move forward');
+});
+
+// ---------------------------------------------------------------------------
+// The panel's view of expiry matches the public site's.
+// ---------------------------------------------------------------------------
+
+/** Backdate a listing past its expiry without running the sweep. */
+function lapse(publicId) {
+  getDb()
+    .prepare("UPDATE listings SET expires_at = datetime('now', '-1 day') WHERE public_id = ?")
+    .run(publicId);
+}
+
+test('the moderation panel shows a lapsed listing as expired, not active', async () => {
+  // Regression: the panel read the stored status, which only catches up when
+  // the sweep runs, so a lapsed ad sat in "Active" while the site served 410.
+  const owner = request.agent(app);
+  const { publicId } = await createListing(owner, { title: 'Quietly lapsed lawnmower' });
+  lapse(publicId);
+
+  const ids = (filter) => adminModel.listFor(filter, { perPage: 1000 }).rows.map((row) => row.public_id);
+  assert.ok(!ids('active').includes(publicId));
+  assert.ok(ids('expired').includes(publicId));
+
+  const activeBefore = adminModel.stats().active;
+  const another = await createListing(owner);
+  lapse(another.publicId);
+  assert.equal(adminModel.stats().active, activeBefore, 'stats should not count it as active');
+});
+
+test('restoring a lapsed listing makes it available again', async () => {
+  // Regression: restore only flipped the status column, so an expired ad was
+  // "restored" with a success message and stayed unavailable.
+  const owner = request.agent(app);
+  const { publicId } = await createListing(owner);
+  lapse(publicId);
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 410);
+
+  const admin = await signInAsAdmin();
+  const panel = await admin.get(`/admin/listing/${publicId}`);
+  await admin
+    .post(`/admin/listing/${publicId}/restore`)
+    .type('form')
+    .send({ _csrf: csrfFrom(panel.text), return_to: 'listing' });
+
+  assert.equal((await request(app).get(`/listing/${publicId}`)).status, 200);
+});
+
+test('a filter named after an Object.prototype member falls back to the default', async () => {
+  // Regression: FILTERS[key] resolved "constructor" to Object's constructor,
+  // and the dashboard crashed with a 500.
+  const admin = await signInAsAdmin();
+  for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+    const response = await admin.get(`/admin?filter=${key}`);
+    assert.equal(response.status, 200, `filter=${key} should render`);
+  }
 });
 
 test('signing out closes the panel again', async () => {

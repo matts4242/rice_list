@@ -71,6 +71,10 @@ CREATE TABLE IF NOT EXISTS flags (
   reason     TEXT NOT NULL,
   note       TEXT NOT NULL DEFAULT '',
   resolved   INTEGER NOT NULL DEFAULT 0,
+  -- Who the report counts as coming from: a keyed hash of the reporter's
+  -- address, never the address itself. Empty on rows from before it existed.
+  -- Databases created earlier gain this column in src/db.js.
+  reporter_key TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
