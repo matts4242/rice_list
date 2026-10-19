@@ -171,12 +171,69 @@ if [ -n "$SWAP_SIZE" ]; then
   case "${BASH_REMATCH[2]}" in [Gg]) SWAP_MB=$(( SWAP_MB * 1024 )) ;; esac
 fi
 
-# The effective sshd port, not whatever the config file happens to say: an
-# Include or a command line override would make the two disagree, and opening
-# the wrong one in the firewall is how people lose access.
-SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
-[ -n "$SSH_PORT" ] || SSH_PORT=22
-info "SSH is listening on port ${SSH_PORT}"
+# sshd -T and sshd -t refuse to run without /run/sshd. ssh.service creates it
+# when it starts, but on Ubuntu 24.04 that service is socket-activated and has
+# not started at all if nobody has logged in over SSH since boot -- exactly
+# the state of a box set up from the provider's console or by cloud-init. It
+# is a runtime directory on tmpfs, made here just as ssh.service makes it.
+ensure_privsep_dir() {
+  [ -d /run/sshd ] || run install -d -m 0755 /run/sshd
+}
+
+# The configuration sshd would really run with, every Include and default
+# resolved. Left empty only by a dry run that may not create /run/sshd.
+SSHD_CONFIG=""
+read_sshd_config() {
+  ensure_privsep_dir
+  if [ "$DRY_RUN" = "yes" ] && [ ! -d /run/sshd ]; then
+    warn "No SSH login since boot, so no /run/sshd and sshd -T cannot run in a dry run; a real run creates it first."
+    return 0
+  fi
+  SSHD_CONFIG="$(sshd -T)" \
+    || die "sshd -T could not read the SSH configuration; fix what it reports above and re-run."
+}
+
+# Every TCP port sshd can be reached on. The config alone is not enough: a
+# port passed with -p in SSHD_OPTS (/etc/default/ssh), or set by an
+# ssh.socket override on 24.04, never shows up in sshd -T, and a config
+# edited since sshd last restarted names ports nothing listens on yet. So
+# take the union of what the config says, what sshd has open, and what
+# ssh.socket listens on for it. A port too many costs nothing; missing the
+# one in use locks everybody out the moment ufw is enabled.
+ssh_ports() {
+  {
+    # "port 22", and "listenaddress 0.0.0.0:2222", whose own port wins.
+    printf '%s\n' "$SSHD_CONFIG" \
+      | awk '$1 == "port" { print $2 } $1 == "listenaddress" { n = split($2, a, ":"); print a[n] }'
+    if command -v ss >/dev/null 2>&1; then
+      ss -Htlnp | awk '$1 == "LISTEN" && /\("sshd",/ { n = split($4, a, ":"); print a[n] }' || true
+    else
+      warn "ss (iproute2) is missing, so the ports sshd has open cannot be checked."
+    fi
+    # With socket activation (24.04's default) systemd holds the listening
+    # socket, so until the first login ss shows it owned by systemd (pid 1),
+    # not sshd. Ask systemd what ssh.socket listens on.
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+      systemctl show -p Listen --value ssh.socket | awk '{ n = split($1, a, ":"); print a[n] }' || true
+    fi
+  } | awk '/^[0-9]+$/ && $1 > 0 && $1 < 65536' | sort -nu | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Never a guessed default: the firewall allows exactly these ports before it
+# is enabled, and fail2ban guards them.
+SSH_PORTS=""
+if [ "$SKIP_FIREWALL" = "no" ] || [ "$SKIP_FAIL2BAN" = "no" ]; then
+  read_sshd_config
+  SSH_PORTS="$(ssh_ports)"
+  if [ -n "$SSH_PORTS" ]; then
+    info "SSH is reachable on port(s) ${SSH_PORTS// /, }"
+  elif [ "$DRY_RUN" = "yes" ]; then
+    warn "Found no port sshd listens on yet; a real run reads them from sshd -T."
+  else
+    die "found no port sshd listens on, so enabling a firewall could lock you out.
+     Check that sshd is installed and running, or pass --no-firewall --no-fail2ban."
+  fi
+fi
 
 ok "Preflight checks passed"
 
@@ -456,10 +513,18 @@ fi
 if [ "$SKIP_FIREWALL" = "no" ]; then
   step "Configuring the firewall"
 
-  # SSH first, always. Enabling ufw with no SSH rule ends the session and the
+  # SSH first, always, on every port sshd can be reached on. Enabling ufw
+  # with the port in use missing refuses every new SSH connection, and the
   # machine is then only reachable through the provider's console.
-  run ufw allow "${SSH_PORT}/tcp" comment "SSH"
-  ok "Allowed SSH on ${SSH_PORT}/tcp"
+  if [ -z "$SSH_PORTS" ]; then
+    # Only a dry run gets here; a real run has already stopped in preflight.
+    [ "$DRY_RUN" = "yes" ] || die "no SSH port known; refusing to enable the firewall."
+    info "[dry-run] ufw allow <each port sshd -T reports>/tcp"
+  fi
+  for port in $SSH_PORTS; do
+    run ufw allow "${port}/tcp" comment "SSH"
+  done
+  ok "Allowed SSH on ${SSH_PORTS:-its port(s)} (tcp)"
 
   old_ifs="$IFS"; IFS=','
   for port in $WEB_PORTS; do
@@ -488,6 +553,7 @@ fi
 if [ "$SKIP_FAIL2BAN" = "no" ]; then
   step "Configuring fail2ban"
 
+  f2b_ports="${SSH_PORTS// /,}"
   write_file /etc/fail2ban/jail.d/ricelist.local 0644 <<JAIL
 # Written by deploy/setup-vps.sh.
 [DEFAULT]
@@ -498,11 +564,33 @@ maxretry = 5
 
 [sshd]
 enabled = true
-port    = ${SSH_PORT}
+port    = ${f2b_ports:-<the SSH ports a real run finds>}
 JAIL
 
-  run systemctl enable --now fail2ban
-  ok "fail2ban watching SSH on port ${SSH_PORT}"
+  # On 24.04 the package starts fail2ban the moment it is installed, with
+  # its stock sshd jail (port 22, 10 minute bans), and "enable --now" does
+  # nothing to a unit that is already running: this file would not load
+  # until a reboot. So check it parses, then restart to load it.
+  if [ "$DRY_RUN" = "no" ] && ! f2b_test="$(fail2ban-client -t 2>&1)"; then
+    printf '%s\n' "$f2b_test" >&2
+    rm -f /etc/fail2ban/jail.d/ricelist.local
+    die "fail2ban rejected its configuration (above); removed the jail file."
+  fi
+  run systemctl enable fail2ban
+  run systemctl restart fail2ban
+
+  # The unit is Type=simple: restart returns once the server process exists,
+  # even if the sshd jail then fails to load. Ask the server itself.
+  if [ "$DRY_RUN" = "no" ]; then
+    tries=0
+    until fail2ban-client status sshd >/dev/null 2>&1; do
+      tries=$(( tries + 1 ))
+      [ "$tries" -lt 20 ] \
+        || die "fail2ban is not running its sshd jail; see 'journalctl -u fail2ban'."
+      sleep 1
+    done
+  fi
+  ok "fail2ban watching SSH on port(s) ${SSH_PORTS:-found by a real run}"
 else
   step "Skipping fail2ban (--no-fail2ban)"
 fi
@@ -547,7 +635,7 @@ ${C_GREEN}${C_BOLD}The VPS is configured.${C_RESET}
 
   Hostname     $(hostname)
   Public IP    ${PUBLIC_IP:-unknown}
-  SSH port     ${SSH_PORT}
+  SSH port(s)  ${SSH_PORTS:-not checked}
   Admin user   ${ADMIN_USER:-<none created>}
   Firewall     $( [ "$SKIP_FIREWALL" = "no" ] && echo "on (SSH + ${WEB_PORTS})" || echo "not configured" )
 
