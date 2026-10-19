@@ -10,9 +10,10 @@
 #   sudo ./deploy/setup-vps.sh --hostname ricelist \
 #        --admin-user matt --ssh-key-file ~/id_ed25519.pub --harden-ssh
 #
-# Locking yourself out of a VPS is the expensive mistake here, so the parts
-# that could do it are opt-in, refuse to run without a working key in place,
-# and never touch the firewall before SSH is allowed through it.
+# Locking yourself out of a VPS is the expensive mistake here. Hardening SSH
+# is opt-in and refuses to run unless sshd will accept a key that is really
+# in place, and the firewall (on by default) is never enabled before every
+# port sshd can be reached on is allowed through it.
 
 set -euo pipefail
 
@@ -22,6 +23,7 @@ HOSTNAME_NEW=""
 TIMEZONE=""
 ADMIN_USER=""
 SSH_KEY=""
+SSH_KEY_FP=""
 SSH_KEY_FILE=""
 HARDEN_SSH="no"
 SWAP_SIZE=""
@@ -78,12 +80,14 @@ Options:
   --timezone ZONE        Set the timezone, e.g. Etc/UTC or America/New_York.
   --admin-user NAME      Create this user with passwordless sudo, for logging
                          in instead of root. Needs a key; see --ssh-key-file.
-  --ssh-key-file PATH    Public key to authorise for the admin user (and for
-                         root, so an existing root session keeps working).
+  --ssh-key-file PATH    Public key to authorise for the admin user, or for
+                         root when there is no --admin-user.
   --ssh-key "ssh-ed25519 AAAA..."
                          Same, given inline.
-  --harden-ssh           Disable root login and password authentication.
-                         Refuses unless an authorised key is already in place.
+  --harden-ssh           Disable password authentication. With --admin-user
+                         and a key, disable root login too; otherwise root
+                         may still log in, by key only. Refuses unless sshd
+                         will accept an authorised key that is in place.
   --swap SIZE            Swap file size, e.g. 2G or 512M. Default: 2G when the
                          machine has under 2 GB of RAM and no swap, otherwise
                          none. Shrunk or skipped to keep 1 GB of disk free.
@@ -148,11 +152,28 @@ if [ -n "$SSH_KEY_FILE" ]; then
   SSH_KEY="$(head -n 1 "$SSH_KEY_FILE")"
 fi
 
+# Fingerprints of the keys ssh-keygen can parse in an authorized_keys-style
+# file ("-" for stdin), one per line. Lines it cannot parse are skipped, just
+# as sshd skips them, so no output means no usable key.
+key_fingerprints() {
+  ssh-keygen -l -f "$1" 2>/dev/null | awk '{ print $2 }' || true
+}
+
 if [ -n "$SSH_KEY" ]; then
   case "$SSH_KEY" in
     ssh-rsa\ *|ssh-ed25519\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519*\ *|sk-ecdsa-sha2-*\ *) : ;;
     *) die "that does not look like an SSH public key. Give the .pub file,
      not the private key." ;;
+  esac
+  # The prefix says only what the key claims to be. A key damaged on the way
+  # here -- a terminal line wrap that put a space in it, a truncated paste --
+  # still passes, and writing that and then disabling passwords locks
+  # everybody out. So ssh-keygen must parse it, as exactly one key.
+  SSH_KEY_FP="$(key_fingerprints - <<<"$SSH_KEY")"
+  case "$SSH_KEY_FP" in
+    "") die "ssh-keygen cannot read that key: it looks damaged (a space or line
+     break inside it, or cut short). Copy it from the .pub file again." ;;
+    *$'\n'*) die "give exactly one public key, not several." ;;
   esac
 fi
 
@@ -186,7 +207,7 @@ SSHD_CONFIG=""
 read_sshd_config() {
   ensure_privsep_dir
   if [ "$DRY_RUN" = "yes" ] && [ ! -d /run/sshd ]; then
-    warn "No SSH login since boot, so no /run/sshd and sshd -T cannot run in a dry run; a real run creates it first."
+    warn "No /run/sshd yet (usual on 24.04 before the first SSH login since boot), so sshd -T cannot run in a dry run; a real run creates it first."
     return 0
   fi
   SSHD_CONFIG="$(sshd -T)" \
@@ -219,11 +240,14 @@ ssh_ports() {
   } | awk '/^[0-9]+$/ && $1 > 0 && $1 < 65536' | sort -nu | tr '\n' ' ' | sed 's/ $//'
 }
 
+if [ "$SKIP_FIREWALL" = "no" ] || [ "$SKIP_FAIL2BAN" = "no" ] || [ "$HARDEN_SSH" = "yes" ]; then
+  read_sshd_config
+fi
+
 # Never a guessed default: the firewall allows exactly these ports before it
 # is enabled, and fail2ban guards them.
 SSH_PORTS=""
 if [ "$SKIP_FIREWALL" = "no" ] || [ "$SKIP_FAIL2BAN" = "no" ]; then
-  read_sshd_config
   SSH_PORTS="$(ssh_ports)"
   if [ -n "$SSH_PORTS" ]; then
     info "SSH is reachable on port(s) ${SSH_PORTS// /, }"
@@ -403,7 +427,7 @@ fi
 # --- Admin user -------------------------------------------------------------
 
 authorize_key_for() {
-  local user="$1" home ssh_dir
+  local user="$1" home ssh_dir keys blob
 
   # In a dry run the adduser above did not actually happen, so the account we
   # are about to key may not exist yet. Say what would happen and move on.
@@ -423,12 +447,25 @@ authorize_key_for() {
     return 0
   fi
   install -d -o "$user" -g "$user" -m 0700 "$ssh_dir"
-  touch "$ssh_dir/authorized_keys"
-  if ! grep -qxF "$SSH_KEY" "$ssh_dir/authorized_keys"; then
-    printf '%s\n' "$SSH_KEY" >> "$ssh_dir/authorized_keys"
+  keys="$ssh_dir/authorized_keys"
+  touch "$keys"
+  # Match on the key itself (its base64 blob), not the whole line, so a
+  # re-run with a different comment does not add a second copy.
+  blob="$(awk '{ print $2 }' <<<"$SSH_KEY")"
+  if ! awk -v b="$blob" '{ for (i = 1; i <= NF; i++) if ($i == b) f = 1 } END { exit !f }' "$keys"; then
+    # If the last line has no newline (a provider-injected key, an echo -n),
+    # appending would glue the new key onto it, and sshd would then reject
+    # both the old key and the new one.
+    if [ -s "$keys" ] && [ -n "$(tail -c 1 "$keys")" ]; then
+      printf '\n' >> "$keys"
+    fi
+    printf '%s\n' "$SSH_KEY" >> "$keys"
   fi
-  chown "$user:$user" "$ssh_dir/authorized_keys"
-  chmod 0600 "$ssh_dir/authorized_keys"
+  chown "$user:$user" "$keys"
+  chmod 0600 "$keys"
+  # Proof rather than hope: the key must now read back out of the file.
+  grep -qxF "$SSH_KEY_FP" <<<"$(key_fingerprints "$keys")" \
+    || die "the key did not end up usable in $keys; check that file by hand."
 }
 
 if [ -n "$ADMIN_USER" ]; then
@@ -459,49 +496,162 @@ SUDOERS
   fi
 fi
 
-# Keep the current root session working after hardening.
-if [ -n "$SSH_KEY" ]; then
+# Root gets the key only when there is no admin account to log in as. With
+# one, --harden-ssh turns root login off, and a copy of the admin's key on
+# root would just be a second way in. (The current session needs nothing:
+# changing sshd's config never affects connections already open.)
+if [ -n "$SSH_KEY" ] && [ -z "$ADMIN_USER" ]; then
+  step "Authorising the key for root"
   authorize_key_for root
+  ok "SSH key authorised for root"
 fi
 
 # --- SSH hardening ----------------------------------------------------------
 
+# Drop-ins rather than an edit of sshd_config, so the packaged file stays
+# pristine for the next release upgrade. sshd keeps the FIRST value it reads
+# for each keyword, and Ubuntu's sshd_config includes sshd_config.d/*.conf at
+# its top, in name order. So what --harden-ssh exists for goes in a file
+# named to be read first, where no provider drop-in (cloud-init's
+# 50-cloud-init.conf turning passwords back on, say) can override it. Only
+# settings that tighten go there; the rest go in a file read last, so an
+# earlier choice of the operator's own -- a stricter PermitRootLogin, a
+# different MaxAuthTries -- still wins.
+SSHD_FIRST=/etc/ssh/sshd_config.d/00-ricelist-hardening.conf
+SSHD_LAST=/etc/ssh/sshd_config.d/99-ricelist-defaults.conf
+SSHD_OLD=/etc/ssh/sshd_config.d/99-ricelist-hardening.conf   # earlier versions
+
+# Where sshd looks for a user's keys: each AuthorizedKeysFile entry from
+# sshd -T, with %h, %u and %% expanded and relative paths taken from the
+# home directory. (OpenSSH's default if sshd -T could not run, as in a dry
+# run before /run/sshd exists.)
+authorized_keys_files() {
+  local user="$1" home spec
+  local -a specs
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  [ -n "$home" ] || return 0
+  read -r -a specs <<<"$(awk '$1 == "authorizedkeysfile" { $1 = ""; print }' <<<"$SSHD_CONFIG")"
+  [ "${#specs[@]}" -gt 0 ] || specs=(.ssh/authorized_keys .ssh/authorized_keys2)
+  for spec in "${specs[@]}"; do
+    [ "$spec" != "none" ] || continue
+    spec="${spec//\%\%/$'\001'}"; spec="${spec//\%h/$home}"
+    spec="${spec//\%u/$user}"; spec="${spec//$'\001'/%}"
+    case "$spec" in /*) ;; *) spec="$home/$spec" ;; esac
+    printf '%s\n' "$spec"
+  done
+}
+
+# Whether sshd would find a key for USER that it can parse -- the key with
+# fingerprint FP, if one is given. A non-empty file proves nothing: a damaged
+# or glued-together key line is as unreadable to sshd as to ssh-keygen.
+sshd_has_key() {
+  local user="$1" want="${2:-}" file fps
+  while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    fps="$(key_fingerprints "$file")"
+    [ -n "$fps" ] || continue
+    if [ -z "$want" ] || grep -qxF "$want" <<<"$fps"; then return 0; fi
+  done < <(authorized_keys_files "$user")
+  return 1
+}
+
+# sshd -t only proves the files parse; sshd -T shows what sshd will really
+# do. Die unless KEYWORD is VALUE there, naming the files that set it first:
+# a drop-in sorting before ours, a line above the Include in sshd_config.
+require_sshd() {
+  local keyword="$1" want="$2" have pattern files
+  have="$(awk -v k="$keyword" '$1 == k { print $2; exit }' <<<"$SSHD_CONFIG")"
+  [ "$have" != "$want" ] || return 0
+  pattern="$keyword"
+  if [ "$keyword" = "kbdinteractiveauthentication" ]; then
+    pattern="(kbdinteractive|challengeresponse)authentication"   # old name, same setting
+  fi
+  files="$(grep -ilE "^[[:space:]]*${pattern}([[:space:]]|=)" \
+             /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+           | grep -vxF "$SSHD_FIRST" | tr '\n' ' ' || true)"
+  die "sshd would still run with ${keyword} ${have:-unset}, not ${want}: sshd keeps the
+     first value it reads, and something sets it before ${SSHD_FIRST}.
+     Files that set it: ${files:-none; check that /etc/ssh/sshd_config Includes sshd_config.d/*.conf}
+     Remove that setting and re-run. (The new drop-ins are valid and stay in place.)"
+}
+
 if [ "$HARDEN_SSH" = "yes" ]; then
   step "Hardening SSH"
 
-  # Refuse to disable password login unless somebody can still get in by key.
-  key_present="no"
-  for candidate in ${ADMIN_USER:+/home/$ADMIN_USER/.ssh/authorized_keys} /root/.ssh/authorized_keys; do
-    [ -s "$candidate" ] && key_present="yes"
-  done
-  if [ -n "$SSH_KEY" ]; then key_present="yes"; fi
+  # With an admin account and its key, root login goes entirely: the admin
+  # logs in and uses sudo. Without one, root keeps key-only login, since its
+  # key is then the way in. By this point the admin's key has been read back
+  # from its file and the sudoers file has passed visudo.
+  root_login="prohibit-password"
+  if [ -n "$ADMIN_USER" ] && [ -n "$SSH_KEY" ]; then root_login="no"; fi
 
-  if [ "$key_present" != "yes" ]; then
-    die "refusing to disable password authentication: no authorized_keys found.
+  # Refuse to disable password login unless sshd itself would accept a key:
+  # one that parses, in a file sshd reads (AuthorizedKeysFile), for an account
+  # that may still log in -- and when a key was given, that very key.
+  if [ -n "$SSH_KEY" ]; then
+    key_user="${ADMIN_USER:-root}"
+    if [ "$DRY_RUN" = "yes" ]; then
+      info "[dry-run] check that sshd reads the new key for ${key_user}"
+    elif ! sshd_has_key "$key_user" "$SSH_KEY_FP"; then
+      die "refusing to disable password authentication: sshd does not read the key
+     just written for ${key_user} (see AuthorizedKeysFile in sshd_config)."
+    fi
+  else
+    key_user=""
+    for candidate in ${ADMIN_USER:-} root ${SUDO_USER:-}; do
+      if sshd_has_key "$candidate"; then key_user="$candidate"; break; fi
+    done
+    if [ -z "$key_user" ]; then
+      die "refusing to disable password authentication: no usable authorized key found.
      Pass --ssh-key-file with your public key, or set one up first.
      Doing this without a key would lock you out of the machine."
+    fi
+    info "${key_user} has an authorised key sshd will accept."
   fi
 
-  # A drop-in rather than an edit of sshd_config: Ubuntu's default config ends
-  # with an Include of this directory, so the last word is ours and the
-  # packaged file stays pristine for the next release upgrade.
-  write_file /etc/ssh/sshd_config.d/99-ricelist-hardening.conf 0644 <<'SSHD'
-# Written by deploy/setup-vps.sh.
-PermitRootLogin prohibit-password
+  root_first=""; root_last="PermitRootLogin prohibit-password"
+  if [ "$root_login" = "no" ]; then root_first="PermitRootLogin no"; root_last=""; fi
+  write_file "$SSHD_FIRST" 0644 <<SSHD
+# Written by deploy/setup-vps.sh. Named to be read first: sshd keeps the
+# first value it sees for each setting, so nothing after this can undo these.
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
+${root_first}
+SSHD
+  write_file "$SSHD_LAST" 0644 <<SSHD
+# Written by deploy/setup-vps.sh. Named to be read last: a value set in any
+# earlier file, by you or your provider, wins over these defaults.
 UsePAM yes
 X11Forwarding no
 MaxAuthTries 4
+${root_last}
 SSHD
 
   if [ "$DRY_RUN" = "no" ]; then
-    sshd -t || { rm -f /etc/ssh/sshd_config.d/99-ricelist-hardening.conf
-                 die "sshd rejected the hardening config; removed it and changed nothing."; }
+    ensure_privsep_dir
+    if ! sshd -t; then
+      rm -f "$SSHD_FIRST" "$SSHD_LAST"
+      die "sshd rejected the hardening config; removed it and changed nothing."
+    fi
+    SSHD_CONFIG="$(sshd -T)" || die "sshd -T failed after writing the hardening config."
+    require_sshd passwordauthentication no
+    require_sshd kbdinteractiveauthentication no
+    if [ "$root_login" = "no" ]; then require_sshd permitrootlogin no; fi
   fi
-  run systemctl reload ssh
-  ok "Root password login and password authentication disabled"
+  if [ -e "$SSHD_OLD" ]; then run rm -f "$SSHD_OLD"; fi
+
+  # try-reload-or-restart, not reload: on 24.04 ssh.service is socket-
+  # activated and does not run until the first SSH login after boot, and
+  # reloading an inactive unit fails. Then there is nothing to reload: the
+  # next connection starts sshd, which reads the new files. (ssh.socket is
+  # left alone; nothing here changes what it listens on.)
+  run systemctl try-reload-or-restart ssh
+  if [ "$root_login" = "no" ]; then
+    ok "Password authentication and root login disabled; log in as ${ADMIN_USER}"
+  else
+    ok "Password authentication disabled; root can log in by key at most"
+  fi
   warn "Before closing this session, open a NEW one and confirm you can log in."
 else
   step "Leaving SSH configuration alone"
