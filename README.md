@@ -32,7 +32,9 @@ Sign in at `/admin/login`.
 **Browsing and search.** Listings are paginated, filterable by category, and
 searchable through a SQLite FTS5 index kept in sync by triggers. Search input
 is tokenised before it reaches FTS, so quotes, hyphens and stray operators in
-the search box can't produce a query error.
+the search box can't produce a query error, and accented or dotted letters
+(café, İstanbul) match however they were typed. A search uses at most eight
+distinct terms, which keeps any one query cheap.
 
 **Posting.** Anyone can post without registering. Each ad gets a secret
 management link — the only way to edit it, delete it, renew it, or read
@@ -42,18 +44,23 @@ shown on screen after posting, so it is never lost to a mail failure.
 **Photos.** Uploads are decoded and re-encoded with sharp before touching
 disk. That is what makes them safe: anything that isn't a real image fails to
 decode, and EXIF metadata (including GPS coordinates) never survives the
-round trip. A thumbnail is generated for listing cards.
+round trip. A thumbnail is generated for listing cards. Images are checked
+for their pixel count before they are decoded, so a small file that would
+decode to gigabytes is refused, and transparent areas become white.
 
 **Contacting sellers.** Buyers use a form on the listing. The message is
 stored in the seller's inbox and relayed by email with the buyer set as
 reply-to. The seller's address is never rendered publicly, and a relay failure
-never loses the message. A hidden honeypot field silently drops bot
-submissions.
+never loses the message: a relay that is down or stalls is given up on after
+20 seconds, and the message stays in the inbox marked as not emailed. A hidden
+honeypot field silently drops bot submissions.
 
-**Moderation.** Anyone can report an ad. Enough unresolved reports auto-hide
-it pending review. Moderators get a queue filtered by state, and can remove,
-restore, dismiss reports, or delete permanently. Removal reasons are recorded
-and shown in the panel.
+**Moderation.** Anyone can report an ad. Once enough different people have
+reported it, it is hidden pending review; repeat reports from the same address
+count once. Moderators get a queue filtered by state, and can remove, restore,
+dismiss reports, or delete permanently. Removal reasons are recorded and shown
+in the panel. A removed ad stays removed: its owner cannot bring it back by
+renewing it. Restoring an ad that lapsed gives it a fresh period.
 
 **Expiry.** Listings expire after a configurable period and can be renewed
 from the management link. The cutoff is applied as listings are read, so an ad
@@ -184,11 +191,18 @@ images.
 - Content Security Policy is restrictive: no inline scripts or styles, no
   third-party origins.
 - Uploads are re-encoded rather than trusted, and served with
-  `X-Content-Type-Options: nosniff`.
+  `X-Content-Type-Options: nosniff`. Image dimensions, the number of form
+  fields and their sizes are all capped before anything expensive happens.
+- Reports record a keyed hash of the reporter's address (an IPv6 address by
+  its /56 prefix), so one person cannot hide an ad alone. The address itself is
+  never stored, and the hash cannot be turned back into one without the
+  site's `SESSION_SECRET`.
 - Admin sessions are regenerated on login so a pre-login cookie cannot be
   promoted. Passwords are stored as scrypt hashes.
 - Posting, messaging, editing, reporting and login are rate limited per
-  address. The edit limit runs before the upload parser, since the manage
+  address. IPv6 clients are grouped by their /56 prefix, since a single host
+  usually holds a whole /64 or more. The admin password check runs off the
+  main thread, so a burst of login attempts cannot stall the site. The edit limit runs before the upload parser, since the manage
   token that authorises an edit arrives in the body multer is still reading.
 
 ## License
