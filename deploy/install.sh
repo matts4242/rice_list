@@ -7,8 +7,8 @@
 #
 # Re-running is safe: it upgrades the checkout, reinstalls dependencies and
 # restarts the service, keeping the existing session secret, admin password,
-# database and every .env setting it does not manage. That makes this the
-# update script too.
+# certificate, database and every .env setting it does not manage. That makes
+# this the update script too.
 #
 #   sudo ./deploy/install.sh --domain ads.example.com --email you@example.com
 #
@@ -28,6 +28,7 @@ PORT="3000"
 SITE_NAME="Rice List"
 NODE_MAJOR_MIN="20"     # package.json requires >= 20
 NODE_MAJOR_INSTALL="22" # what we pull from NodeSource if the distro is older
+LETSENCRYPT_DIR="/etc/letsencrypt"
 BACKUP_DIR="/var/backups/ricelist"  # shared with deploy/redeploy.sh
 POLICY_RC_D="/usr/sbin/policy-rc.d"
 
@@ -118,8 +119,9 @@ variable. There is deliberately no --admin-password flag, because command line
 arguments are visible to every user on the machine via ps.
 
 Re-running with the same options updates the site. Settings you added to the
-app's .env by hand -- SMTP, MAIL_FROM, limits -- are kept, and .env is backed
-up to /var/backups/ricelist before it is changed.
+app's .env by hand -- SMTP, MAIL_FROM, limits -- are kept, the certificate
+already issued is reused without asking Let's Encrypt again, and .env is
+backed up to /var/backups/ricelist before it is changed.
 
 A note on TLS. In production the session cookie is marked Secure, so a browser
 will not store it over plain HTTP. Without TLS somewhere in the chain the site
@@ -350,6 +352,7 @@ fi
 ENV_FILE="$APP_DIR/.env"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 NGINX_SITE="/etc/nginx/sites-available/${SERVICE_NAME}"
+FORWARDED_CONF="/etc/nginx/conf.d/${SERVICE_NAME}-forwarded.conf"
 
 # Everything below reads, and edits, a private copy of .env; the real file is
 # replaced once, at the end. It lives in a directory the service account
@@ -1034,7 +1037,7 @@ SERVER_NAME="$DOMAIN"
 # our own certificate the scheme here is authoritative, so use it directly and
 # ignore anything the client claims.
 if [ "$NO_TLS" = "yes" ]; then
-  cat > /etc/nginx/conf.d/${SERVICE_NAME}-forwarded.conf <<'MAP'
+  cat > "$FORWARDED_CONF" <<'MAP'
 map $http_x_forwarded_proto $ricelist_forwarded_proto {
     default   $scheme;
     "~^https$" https;
@@ -1045,7 +1048,8 @@ MAP
   # shellcheck disable=SC2016
   FORWARDED_PROTO='$ricelist_forwarded_proto'
 else
-  rm -f /etc/nginx/conf.d/${SERVICE_NAME}-forwarded.conf
+  # The map itself goes once the new configuration has passed nginx -t: until
+  # then the configuration it replaces may still refer to it.
   # shellcheck disable=SC2016
   FORWARDED_PROTO='$scheme'
 fi
@@ -1070,18 +1074,55 @@ fi
 
 # Only bind IPv6 where the kernel actually has it: on a host with IPv6
 # disabled, "listen [::]:80" makes nginx fail to start outright.
-LISTEN_DIRECTIVES="    listen 80;"
+LISTEN_HTTP="    listen 80;"
+LISTEN_HTTPS="    listen 443 ssl;"
 if [ -f /proc/net/if_inet6 ]; then
-  LISTEN_DIRECTIVES="${LISTEN_DIRECTIVES}"$'\n'"    listen [::]:80;"
+  LISTEN_HTTP+=$'\n'"    listen [::]:80;"
+  LISTEN_HTTPS+=$'\n'"    listen [::]:443 ssl;"
 else
   info "No IPv6 on this host; nginx will listen on IPv4 only."
 fi
 
-cat > "$NGINX_SITE" <<NGINX
-server {
-${LISTEN_DIRECTIVES}
-    server_name ${SERVER_NAME};${REAL_IP}
+# The certificate file site file $1 serves, if any.
+site_cert() {
+  awk '$1 == "ssl_certificate" { sub(/;.*/, "", $2); print $2; exit }' "$1" 2>/dev/null
+}
 
+# Whether certificate file $1 is there, has not expired, and covers DOMAIN.
+cert_usable() {
+  [ -s "$1" ] && openssl x509 -checkend 0 -noout -in "$1" >/dev/null 2>&1 \
+    && openssl x509 -noout -checkhost "$DOMAIN" -in "$1" 2>/dev/null | grep -q ' does match '
+}
+
+# A certificate from an earlier run. When there is one, the HTTPS
+# configuration is written here directly, instead of starting again from
+# plain HTTP and having certbot convert it: inside its 30-day renewal window
+# that conversion needs a fresh ACME round trip, and if Let's Encrypt was down
+# or rate limiting, a routine re-run left the site on HTTP only -- which every
+# browser that had seen its HSTS header refuses -- while a valid certificate
+# sat on disk. Only certbot's own lineages count, since certbot.timer renews
+# them in place: the one named after the domain, or else the one the site
+# serves now (certbot names a second lineage for a name DOMAIN-0001).
+CERT_DIR=""
+if [ "$NO_TLS" = "no" ]; then
+  for cert in "${LETSENCRYPT_DIR}/live/${DOMAIN}/fullchain.pem" "$(site_cert "$NGINX_SITE")"; do
+    case "$cert" in "${LETSENCRYPT_DIR}"/live/*/fullchain.pem) ;; *) continue ;; esac
+    if cert_usable "$cert" && [ -s "${cert%/*}/privkey.pem" ]; then
+      CERT_DIR="${cert%/*}"
+      break
+    fi
+  done
+  if [ -z "$CERT_DIR" ] && [ -e "${LETSENCRYPT_DIR}/live/${DOMAIN}/fullchain.pem" ]; then
+    warn "The certificate in ${LETSENCRYPT_DIR}/live/${DOMAIN} has expired or does not"
+    warn "cover ${DOMAIN}; certbot will be asked for a new one."
+  fi
+fi
+HAVE_CERT="no"
+if [ -n "$CERT_DIR" ]; then HAVE_CERT="yes"; fi
+
+# The part of a server block that hands requests to the app.
+app_proxy() {
+  cat <<NGINX
     # Large enough for ${MAX_IMAGES} images of $(( MAX_IMAGE_BYTES / 1048576 )) MB.
     # nginx defaults to 1 MB and would reject uploads with a 413.
     client_max_body_size ${UPLOAD_LIMIT_MB}m;
@@ -1096,19 +1137,85 @@ ${LISTEN_DIRECTIVES}
         proxy_set_header X-Forwarded-Proto ${FORWARDED_PROTO};
         proxy_read_timeout 60s;
     }
+NGINX
+}
+
+# The site as this run configures it.
+render_site() {
+  local ssl_settings
+  if [ "$HAVE_CERT" = "yes" ]; then
+    # What certbot itself would have added, from the files it keeps for this.
+    ssl_settings="    ssl_protocols TLSv1.2 TLSv1.3;"
+    if [ -f "${LETSENCRYPT_DIR}/options-ssl-nginx.conf" ]; then
+      ssl_settings="    include ${LETSENCRYPT_DIR}/options-ssl-nginx.conf;"
+    fi
+    if [ -f "${LETSENCRYPT_DIR}/ssl-dhparams.pem" ]; then
+      ssl_settings+=$'\n'"    ssl_dhparam ${LETSENCRYPT_DIR}/ssl-dhparams.pem;"
+    fi
+    cat <<NGINX
+server {
+${LISTEN_HTTPS}
+    server_name ${SERVER_NAME};${REAL_IP}
+
+    # Issued by certbot, which renews it in place.
+    ssl_certificate     ${CERT_DIR}/fullchain.pem;
+    ssl_certificate_key ${CERT_DIR}/privkey.pem;
+${ssl_settings}
+
+$(app_proxy)
+}
+
+server {
+${LISTEN_HTTP}
+    server_name ${SERVER_NAME};
+    return 301 https://${SERVER_NAME}\$request_uri;
 }
 NGINX
+  else
+    cat <<NGINX
+server {
+${LISTEN_HTTP}
+    server_name ${SERVER_NAME};${REAL_IP}
+
+$(app_proxy)
+}
+NGINX
+  fi
+}
+
+# Keep what nginx is running now. A new configuration that fails nginx -t is
+# swapped straight back out, rather than left on disk for the next reload --
+# certbot's renewal hook, or a reboot -- to fail on.
+SITE_PREVIOUS="${NGINX_SITE}.previous"
+rm -f "$SITE_PREVIOUS"
+if [ -f "$NGINX_SITE" ]; then cp -p "$NGINX_SITE" "$SITE_PREVIOUS"; fi
+
+render_site > "$NGINX_SITE"
 
 ln -sfn "$NGINX_SITE" "/etc/nginx/sites-enabled/${SERVICE_NAME}"
 # Ubuntu's packaged default site answers on port 80 for every hostname and
 # would otherwise shadow ours for requests that do not name the domain.
 rm -f /etc/nginx/sites-enabled/default
 
-nginx -t >/dev/null 2>&1 || { nginx -t; die "nginx rejected its configuration."; }
+if ! nginx -t >/dev/null 2>&1; then
+  nginx -t || true
+  if [ -f "$SITE_PREVIOUS" ]; then
+    cp -p "$SITE_PREVIOUS" "$NGINX_SITE"
+  else
+    rm -f "$NGINX_SITE" "/etc/nginx/sites-enabled/${SERVICE_NAME}"
+  fi
+  die "nginx rejected the new configuration (above). It has been taken back out
+     and nginx was not reloaded, so whatever it served before it still serves."
+fi
+if [ "$NO_TLS" = "no" ]; then rm -f "$FORWARDED_CONF"; fi
 # reload-or-restart rather than reload: it also starts an nginx that is not
 # running, as after a package install whose start a policy-rc.d held back.
 systemctl reload-or-restart nginx
-ok "nginx serving ${SERVER_NAME} on port 80"
+if [ "$HAVE_CERT" = "yes" ]; then
+  ok "nginx serving https://${SERVER_NAME}, with HTTP redirecting to it"
+else
+  ok "nginx serving ${SERVER_NAME} on port 80"
+fi
 
 # --- TLS --------------------------------------------------------------------
 
@@ -1116,6 +1223,13 @@ if [ "$NO_TLS" = "yes" ]; then
   step "Skipping TLS (--no-tls)"
   warn "Remember: without HTTPS the session cookie is never stored and every"
   warn "form on the site will fail. Put TLS in front of this host."
+elif [ "$HAVE_CERT" = "yes" ]; then
+  step "Using the certificate already issued for ${DOMAIN}"
+  ok "HTTPS stayed up throughout; Let's Encrypt was not contacted"
+  if ! openssl x509 -checkend 1209600 -noout -in "${CERT_DIR}/fullchain.pem" >/dev/null 2>&1; then
+    warn "It expires within two weeks, which means renewal is failing."
+    warn "See why with: certbot renew --dry-run"
+  fi
 else
   step "Obtaining a certificate for ${DOMAIN}"
   apt-get install -y -qq certbot python3-certbot-nginx >/dev/null
@@ -1132,10 +1246,30 @@ else
     ok "HTTPS enabled, with HTTP redirecting to it"
     systemctl reload nginx
   else
-    warn "certbot failed. The site is up on plain HTTP, but forms will not"
-    warn "work until TLS is in place. The usual cause is DNS: ${DOMAIN} must"
-    warn "already resolve to this machine, and ports 80 and 443 must be open."
-    warn "Fix that, then run: certbot --nginx -d ${DOMAIN}"
+    # The site went onto plain HTTP for certbot to convert. If what ran
+    # before served a certificate that is still valid -- the operator's own,
+    # say, which is not certbot's to renew -- go back to it rather than leave
+    # HTTPS down for every browser that has seen the site's HSTS header.
+    restored="no"
+    if [ -f "$SITE_PREVIOUS" ] && cert_usable "$(site_cert "$SITE_PREVIOUS")"; then
+      cp -p "$SITE_PREVIOUS" "$NGINX_SITE"
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx
+        restored="yes"
+      else
+        render_site > "$NGINX_SITE"
+      fi
+    fi
+    if [ "$restored" = "yes" ]; then
+      warn "certbot failed, so the nginx configuration from before this run is"
+      warn "back in place, still serving its certificate over HTTPS. Find out"
+      warn "why with: certbot --nginx -d ${DOMAIN}"
+    else
+      warn "certbot failed. The site is up on plain HTTP, but forms will not"
+      warn "work until TLS is in place. The usual cause is DNS: ${DOMAIN} must"
+      warn "already resolve to this machine, and ports 80 and 443 must be open."
+      warn "Fix that, then run: certbot --nginx -d ${DOMAIN}"
+    fi
   fi
 fi
 
