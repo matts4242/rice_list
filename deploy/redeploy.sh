@@ -74,7 +74,9 @@ revision, reinstall dependencies, restart the service, and check the result:
 service must still be running without systemd having restarted it. If the
 install or the check fails, it restores the previous commit together with the
 node_modules it was running with, and restarts that, so a bad deploy
-self-corrects.
+self-corrects. A run that is interrupted part-way (Ctrl-C, a dropped SSH
+session) puts the previous version back on its way out, and one that was
+killed outright is put back by the next run.
 
 The database is never rolled back automatically -- that could throw away
 writes made after the backup. If a release damages your data, restore the
@@ -141,6 +143,16 @@ run_as_service() {
 }
 git_app() { run_as_service git -C "$APP_DIR" "$@"; }
 
+# Check out a commit: on the given branch, moving the branch to it, or
+# detached when the branch is empty.
+checkout_release() {
+  if [ -n "$1" ]; then
+    git_app checkout --quiet --force -B "$1" "$2"
+  else
+    git_app checkout --quiet --force "$2"
+  fi
+}
+
 # Read a setting the way the app will. It loads .env with dotenv, which strips
 # quotes and trailing comments and lets a later line override an earlier one,
 # so ask the app's own dotenv, through the service's node and as the service
@@ -190,6 +202,36 @@ if [ -n "$DB_PATH" ]; then
   DB_PATH="$(app_path "$DB_PATH")"
 else
   DB_PATH="$DATA_DIR/rice-list.db"
+fi
+
+# Until a new release is shown to work, the node_modules the previous one ran
+# with waits beside it as node_modules.prev, labelled with that release's
+# commit and branch, and the exit trap below puts both back however the run
+# ends. A kill -9 or a power cut skips the trap, though, and leaves a release
+# that was never verified on disk for the next start to run. So undo that
+# first, then go all the way through the restart and the checks even if the
+# target is already checked out, so that what runs matches what is on disk.
+NODE_MODULES="$APP_DIR/node_modules"
+SAVED_MODULES="$APP_DIR/node_modules.prev"
+RELEASE_LABEL=".ricelist-release"
+if [ -e "$SAVED_MODULES" ]; then
+  warn "An earlier redeploy was stopped before it finished."
+  saved_commit=""; saved_branch=""
+  if [ -f "$SAVED_MODULES/$RELEASE_LABEL" ]; then
+    read -r saved_commit saved_branch < "$SAVED_MODULES/$RELEASE_LABEL" || true
+  fi
+  if [ -n "$saved_commit" ] && git_app cat-file -e "${saved_commit}^{commit}" 2>/dev/null; then
+    checkout_release "$saved_branch" "$saved_commit"
+    run_as_service rm -rf "$NODE_MODULES"
+    run_as_service mv -T "$SAVED_MODULES" "$NODE_MODULES"
+    run_as_service rm -f "$NODE_MODULES/$RELEASE_LABEL"
+    ok "Put back $(git_app rev-parse --short HEAD) and the node_modules it ran with"
+  else
+    run_as_service rm -rf "$SAVED_MODULES"
+    warn "Its saved node_modules does not say which release it belongs to; discarded it."
+  fi
+  FORCE="yes"
+  info "Deploying in full this time, so that what runs matches what is on disk."
 fi
 
 PREVIOUS_COMMIT="$(git_app rev-parse HEAD)"
@@ -259,14 +301,16 @@ if [ "$SKIP_BACKUP" = "no" ]; then
      restore this release."
   fi
 
-  # Keep the newest $KEEP, drop the rest. The timestamp in the name is
-  # fixed-width, so sorting the names is sorting by age.
+  # Keep the newest $KEEP, this run's among them, and drop the rest. The
+  # timestamp in the name is fixed-width, so sorting the names is sorting by
+  # age. This run's backup is set aside rather than trusted to sort first: a
+  # clock that has been put back would date it older than the others.
   existing_backups=()
   for candidate in "${BACKUP_DIR}"/rice-list-*.db; do
-    [ -e "$candidate" ] && existing_backups+=("$candidate")
+    [ -e "$candidate" ] && [ "$candidate" != "$BACKUP_FILE" ] && existing_backups+=("$candidate")
   done
-  if [ "${#existing_backups[@]}" -gt "$KEEP" ]; then
-    mapfile -t old_backups < <(printf '%s\n' "${existing_backups[@]}" | sort -r | tail -n "+$((KEEP + 1))")
+  if [ "${#existing_backups[@]}" -gt "$((KEEP - 1))" ]; then
+    mapfile -t old_backups < <(printf '%s\n' "${existing_backups[@]}" | sort -r | tail -n "+${KEEP}")
     for stale in "${old_backups[@]}"; do
       # Anything that opens a backup leaves -wal/-shm beside it. Take those
       # with it, or they outlive every backup they belong to.
@@ -301,6 +345,12 @@ if [ "$TARGET_REF" != "HEAD" ] \
     && git_app show-ref --verify --quiet "refs/remotes/origin/${TARGET_REF}"; then
   TARGET_BRANCH="$TARGET_REF"
   TARGET_COMMIT="$(git_app rev-parse "refs/remotes/origin/${TARGET_REF}")"
+elif [ -z "$REF" ]; then
+  # Followed, but not on origin. Taking the name literally would find the
+  # local branch of that name and quietly redeploy whatever it last held.
+  die "${TARGET_REF}, the branch this install follows, is not on origin, so
+     there is nothing to update it from. Name what to deploy with --ref; a
+     branch named that way is followed from then on."
 elif git_app rev-parse --verify --quiet "${TARGET_REF}^{commit}" >/dev/null; then
   # ^{commit} peels an annotated tag to the commit it names, so it compares
   # equal to HEAD when that commit is already deployed.
@@ -327,16 +377,82 @@ if [ "$TARGET_COMMIT" = "$PREVIOUS_COMMIT" ] && [ "$FORCE" = "no" ]; then
   exit 0
 fi
 
-# Check out a commit: on the given branch, moving the branch to it, or
-# detached when the branch is empty.
-checkout_release() {
-  if [ -n "$1" ]; then
-    git_app checkout --quiet --force -B "$1" "$2"
-  else
-    git_app checkout --quiet --force "$2"
-  fi
+# Put the previous release back as it was: its commit, on its branch if it was
+# on one, with the node_modules it was running with. Reinstalling the old
+# commit's dependencies instead would need the registry, which may be the very
+# thing that just failed, and would empty node_modules again on the way.
+# MODULES says where that node_modules is: live (not touched yet), saved (in
+# node_modules.prev) or none (there was none). Safe to call twice: the exit
+# trap may call it again when a run is stopped part-way through it.
+MODULES="live"
+RESTORED="no"
+restore_previous_release() {
+  [ "$RESTORED" = "no" ] || return 0
+  checkout_release "$PREVIOUS_BRANCH" "$PREVIOUS_COMMIT"
+  case "$MODULES" in
+    saved)
+      if [ -d "$SAVED_MODULES" ]; then
+        run_as_service rm -rf "$NODE_MODULES"
+        run_as_service mv -T "$SAVED_MODULES" "$NODE_MODULES"
+        run_as_service rm -f "$NODE_MODULES/$RELEASE_LABEL"
+      fi
+      ok "Restored $(git_app rev-parse --short HEAD) and the node_modules it ran with" ;;
+    none)
+      run_as_service rm -rf "$NODE_MODULES"
+      ok "Restored $(git_app rev-parse --short HEAD)"
+      warn "It had no node_modules before this run either, so there is none to put back." ;;
+    *)
+      ok "Restored $(git_app rev-parse --short HEAD)" ;;
+  esac
+  RESTORED="yes"
 }
 
+# From the checkout below until the new release has been shown to work, or the
+# previous one is back, what is on disk is a release nobody has seen run. If
+# the run stops in between -- Ctrl-C, the SSH session dropping during a long
+# npm ci, output piped into something that went away, a command failing under
+# set -e -- put the previous release back on the way out, or the next restart
+# (a reboot, say) would start a half-installed one. If the service was already
+# restarted onto the new release, restart it onto the old one too, unless
+# --no-rollback asked for the new one to stay.
+IN_FLIGHT="no"
+RESTARTED="no"
+on_exit() {
+  local status=$?
+  if [ "$IN_FLIGHT" = "yes" ]; then
+    IN_FLIGHT="no"
+    # This is what makes stopping safe, so nothing may stop it, and a closed
+    # terminal or pipe must not kill it on its first message.
+    trap '' INT TERM HUP PIPE
+    set +e
+    if [ "$RESTARTED" = "yes" ] && [ "$ROLLBACK" = "no" ]; then
+      discard_saved_modules
+      warn "Stopped before the new release was checked; --no-rollback leaves it running."
+    else
+      warn "Stopped before the new release was shown to work; putting the previous version back."
+      restore_previous_release
+      if [ "$RESTARTED" = "yes" ]; then
+        systemctl restart "$SERVICE_NAME"
+        warn "Restarted ${SERVICE_NAME} on the previous version without checking it."
+      fi
+    fi
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 141' PIPE
+trap 'exit 143' TERM
+
+# Once nothing will put it back. The label goes first, so that a run stopped
+# half-way through deleting it leaves a tree the next run knows not to trust.
+discard_saved_modules() {
+  run_as_service rm -f "$SAVED_MODULES/$RELEASE_LABEL"
+  run_as_service rm -rf "$SAVED_MODULES"
+}
+
+IN_FLIGHT="yes"
 checkout_release "$TARGET_BRANCH" "$TARGET_COMMIT"
 ok "Checked out $(git_app rev-parse --short HEAD)${TARGET_BRANCH:+ on ${TARGET_BRANCH}}"
 
@@ -346,9 +462,6 @@ git_app --no-pager log --oneline -5 "${PREVIOUS_COMMIT}..${TARGET_COMMIT}" 2>/de
 # --- Dependencies -----------------------------------------------------------
 
 step "Installing dependencies"
-
-NODE_MODULES="$APP_DIR/node_modules"
-SAVED_MODULES="$APP_DIR/node_modules.prev"
 
 install_dependencies() {
   run_as_service npm --prefix "$APP_DIR" ci --omit=dev --no-audit --no-fund
@@ -374,32 +487,18 @@ missing_dependencies() {
   ' "$APP_DIR" 2>/dev/null || printf 'unknown'
 }
 
-# Put the previous release back as it was: its commit, on its branch if it was
-# on one, with the node_modules it was running with. Reinstalling the old
-# commit's dependencies instead would need the registry, which may be the very
-# thing that just failed, and would empty node_modules again on the way.
-restore_previous_release() {
-  checkout_release "$PREVIOUS_BRANCH" "$PREVIOUS_COMMIT"
-  run_as_service rm -rf "$NODE_MODULES"
-  if [ -d "$SAVED_MODULES" ]; then
-    run_as_service mv "$SAVED_MODULES" "$NODE_MODULES"
-    ok "Restored $(git_app rev-parse --short HEAD) and the node_modules it ran with"
-  else
-    ok "Restored $(git_app rev-parse --short HEAD)"
-    warn "It had no node_modules before this run either, so there is none to put back."
-  fi
-}
-
 # npm ci starts by deleting node_modules, and until the new tree is installed,
 # verified and serving, the running release's copy is the only one known to
-# work. Move it aside instead of letting npm destroy it. One left over from an
-# interrupted run belongs to a commit that is no longer the previous one, so
-# it protects nothing.
-if [ -e "$SAVED_MODULES" ]; then
-  run_as_service rm -rf "$SAVED_MODULES"
-fi
+# work. Move it aside instead of letting npm destroy it, labelled first so a
+# saved tree always says which release it belongs to. -T, so that the move can
+# never land inside a directory that should not be there.
 if [ -d "$NODE_MODULES" ]; then
-  run_as_service mv "$NODE_MODULES" "$SAVED_MODULES"
+  printf '%s %s\n' "$PREVIOUS_COMMIT" "$PREVIOUS_BRANCH" \
+    | run_as_service tee "$NODE_MODULES/$RELEASE_LABEL" >/dev/null
+  run_as_service mv -T "$NODE_MODULES" "$SAVED_MODULES"
+  MODULES="saved"
+else
+  MODULES="none"
 fi
 
 install_dependencies || warn "npm reported a failure; checking what landed."
@@ -415,6 +514,7 @@ if [ -n "$missing" ]; then
   warn "These dependencies are still missing: ${missing}"
   step "Putting the previous version back"
   restore_previous_release
+  IN_FLIGHT="no"
   die "the new release's dependencies would not install, so nothing changed:
      the service was not restarted and is still running the previous version.
      Fix whatever stopped npm (network, disk space, memory) and run this again."
@@ -464,6 +564,7 @@ restart_count() {
 restart_and_verify() {
   local restarts now attempt=1
   FAILURE=""
+  RESTARTED="yes"
   if ! systemctl restart "$SERVICE_NAME"; then
     FAILURE="systemctl could not restart ${SERVICE_NAME}"
     return 1
@@ -490,13 +591,15 @@ restart_and_verify() {
 step "Restarting the service"
 
 if restart_and_verify; then
+  IN_FLIGHT="no"
   ok "Site is answering on port ${PORT}, and still was ${SETTLE_SECONDS}s later"
 else
   warn "The new release is not working: ${FAILURE}."
 
   if [ "$ROLLBACK" = "no" ]; then
+    IN_FLIGHT="no"
     # Nothing is going to put the saved node_modules back now.
-    run_as_service rm -rf "$SAVED_MODULES"
+    discard_saved_modules
     printf '\n'
     systemctl status "$SERVICE_NAME" --no-pager --lines=30 || true
     die "deploy failed and --no-rollback was given, so the new code is still
@@ -504,12 +607,18 @@ else
        sudo ./deploy/redeploy.sh --ref ${PREVIOUS_COMMIT}"
   fi
 
+  # The previous release stays "in flight" until the service has been restarted
+  # onto it, so that a run stopped before then still puts it back and restarts.
   step "Rolling back to the previous version"
   restore_previous_release
   # Only when there was nothing to put back: a reinstall needs the registry.
   [ -d "$NODE_MODULES" ] || install_dependencies || true
 
-  if restart_and_verify; then
+  rollback_works="no"
+  restart_and_verify && rollback_works="yes"
+  IN_FLIGHT="no"
+
+  if [ "$rollback_works" = "yes" ]; then
     printf '\n%s%sDeploy failed; the previous version is back up.%s\n\n' \
       "$C_YELLOW" "$C_BOLD" "$C_RESET"
     info "Running again: $(git_app rev-parse --short HEAD)"
@@ -529,7 +638,7 @@ else
 fi
 
 # The new release is serving, so the old node_modules has done its job.
-run_as_service rm -rf "$SAVED_MODULES"
+discard_saved_modules
 remember_target_branch
 
 # --- Summary ----------------------------------------------------------------
