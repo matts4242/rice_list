@@ -37,6 +37,7 @@ NO_TLS="no"
 CONFIGURE_FIREWALL="no"
 ADMIN_PASSWORD_FILE=""
 SITE_NAME_GIVEN="no"
+TRUSTED_PROXIES=()
 
 # --- Output helpers ---------------------------------------------------------
 
@@ -78,6 +79,14 @@ Options:
   --no-tls                  Skip certbot and serve plain HTTP on port 80. Only
                             correct when something in front of this box (a load
                             balancer, Cloudflare) terminates TLS -- see below.
+                            Requires --trusted-proxy.
+  --trusted-proxy CIDR      Address range the load balancer or CDN in front of
+                            this host connects from, e.g. 10.0.0.0/8. Repeat
+                            for several. nginx takes the visitor's address from
+                            X-Forwarded-For only on connections from these
+                            ranges, so rate limits apply per visitor instead of
+                            to everyone behind the proxy at once. Required with
+                            --no-tls; 0.0.0.0/0 and ::/0 are refused.
   --admin-password-file F   Read the moderation password from file F instead of
                             prompting. The file is not modified or deleted.
   --repo URL                Git repository to install from.
@@ -120,6 +129,7 @@ while [ $# -gt 0 ]; do
     --domain)              DOMAIN="${2:-}"; shift 2 ;;
     --email)               LETSENCRYPT_EMAIL="${2:-}"; shift 2 ;;
     --no-tls)              NO_TLS="yes"; shift ;;
+    --trusted-proxy)       TRUSTED_PROXIES+=("${2:-}"); shift 2 ;;
     --admin-password-file) ADMIN_PASSWORD_FILE="${2:-}"; shift 2 ;;
     --repo)                REPO_URL="${2:-}"; shift 2 ;;
     --branch)              BRANCH="${2:-}"; shift 2 ;;
@@ -183,6 +193,81 @@ if [ "$SITE_NAME_GIVEN" = "yes" ]; then
   [ -n "$SITE_NAME" ] || die "--site-name cannot be empty."
   site_name_writable "$SITE_NAME" \
     || die "--site-name cannot contain double quotes, backticks, backslashes or control characters."
+fi
+
+# An address or CIDR range for set_real_ip_from. Checked here, before
+# anything is installed, rather than left to nginx -t: it is written into the
+# config verbatim.
+valid_ipv4() {
+  local a b c d octet
+  case "$1" in
+    *[!0-9.]*|*.*.*.*.*|*..*|.*|*.) return 1 ;;
+    *.*.*.*) ;;
+    *) return 1 ;;
+  esac
+  IFS=. read -r a b c d <<< "$1"
+  for octet in "$a" "$b" "$c" "$d"; do
+    if [ "${#octet}" -gt 3 ] || [ "$((10#$octet))" -gt 255 ]; then return 1; fi
+  done
+}
+
+valid_ipv6() {
+  local addr="$1" group groups=0
+  # A trailing dotted quad (::ffff:192.0.2.1) stands for the last two groups.
+  case "$addr" in
+    *.*)
+      valid_ipv4 "${addr##*:}" || return 1
+      addr="${addr%:*}:0:0" ;;
+  esac
+  case "$addr" in
+    *[!0-9a-fA-F:]*|*:::*|*::*::*|:[!:]*|*[!:]:) return 1 ;;
+  esac
+  local IFS=:
+  for group in $addr; do
+    [ -n "$group" ] || continue
+    [ "${#group}" -le 4 ] || return 1
+    groups=$((groups + 1))
+  done
+  case "$addr" in
+    *::*) [ "$groups" -le 7 ] ;;
+    *)    [ "$groups" -eq 8 ] ;;
+  esac
+}
+
+valid_cidr() {
+  local addr="${1%/*}" bits="" max
+  if [ "$addr" != "$1" ]; then
+    bits="${1##*/}"
+    case "$bits" in ''|*[!0-9]*|????*) return 1 ;; esac
+  fi
+  case "$addr" in
+    *:*) valid_ipv6 "$addr" || return 1; max=128 ;;
+    *)   valid_ipv4 "$addr" || return 1; max=32 ;;
+  esac
+  [ -z "$bits" ] || [ "$((10#$bits))" -le "$max" ]
+}
+
+for cidr in "${TRUSTED_PROXIES[@]}"; do
+  valid_cidr "$cidr" \
+    || die "--trusted-proxy takes an address or range such as 10.0.0.0/8, got: ${cidr}"
+  if [ "${cidr%/*}" != "$cidr" ] && [ "$((10#${cidr##*/}))" -eq 0 ]; then
+    die "--trusted-proxy ${cidr} would trust every address there is, so any client
+     could send its own X-Forwarded-For and pick the address rate limits see.
+     Give the ranges your load balancer or CDN actually connects from."
+  fi
+done
+
+# Behind --no-tls something else terminates TLS and connects to nginx, so
+# nginx sees that proxy's address on every request and the app -- trusting
+# one hop, nginx -- would see it too: one wrong password typed ten times
+# would lock every visitor out of moderation, and five ads site-wide would
+# stop all posting. Only the proxy's ranges let nginx recover the visitor's
+# address without letting anyone else forge theirs.
+if [ "$NO_TLS" = "yes" ] && [ "${#TRUSTED_PROXIES[@]}" -eq 0 ]; then
+  die "--no-tls needs --trusted-proxy with the address range of the load balancer
+     or CDN in front of this host (for example --trusted-proxy 10.0.0.0/8).
+     Without it every visitor looks like the proxy, and the rate limits on
+     posting, messages and moderation sign-in apply to all of them at once."
 fi
 
 if [ -n "$ADMIN_PASSWORD_FILE" ] && [ ! -r "$ADMIN_PASSWORD_FILE" ]; then
@@ -720,7 +805,9 @@ SESSION_SECRET=${SESSION_SECRET}
 
 # nginx is the only thing talking to this process, so trust its forwarded
 # headers -- without this every request looks like it came from 127.0.0.1 and
-# the rate limits apply to the whole internet at once.
+# the rate limits apply to the whole internet at once. Behind a load balancer
+# nginx itself recovers the visitor's address (--trusted-proxy), so one hop
+# is still right.
 TRUST_PROXY=1
 
 # Kept outside the checkout so upgrades never touch the database or uploads.
@@ -918,6 +1005,24 @@ else
   FORWARDED_PROTO='$scheme'
 fi
 
+# Behind a load balancer or CDN every connection comes from the proxy, so
+# $remote_addr -- and through X-Forwarded-For the app's idea of the client --
+# is the proxy, for every visitor alike. real_ip swaps in the address the
+# proxy reports, but only on connections from the ranges given: trusted from
+# anywhere, the header would let any client pick its own address. Recursive,
+# it walks back over every trusted hop to the first address the proxies did
+# not vouch for, so whatever a visitor wrote into the header themselves is
+# never reached.
+REAL_IP=""
+if [ "${#TRUSTED_PROXIES[@]}" -gt 0 ]; then
+  REAL_IP=$'\n'
+  for cidr in "${TRUSTED_PROXIES[@]}"; do
+    REAL_IP+="    set_real_ip_from ${cidr};"$'\n'
+  done
+  REAL_IP+="    real_ip_header X-Forwarded-For;"$'\n'
+  REAL_IP+="    real_ip_recursive on;"
+fi
+
 # Only bind IPv6 where the kernel actually has it: on a host with IPv6
 # disabled, "listen [::]:80" makes nginx fail to start outright.
 LISTEN_DIRECTIVES="    listen 80;"
@@ -930,7 +1035,7 @@ fi
 cat > "$NGINX_SITE" <<NGINX
 server {
 ${LISTEN_DIRECTIVES}
-    server_name ${SERVER_NAME};
+    server_name ${SERVER_NAME};${REAL_IP}
 
     # Large enough for ${MAX_IMAGES} images of $(( MAX_IMAGE_BYTES / 1048576 )) MB.
     # nginx defaults to 1 MB and would reject uploads with a 413.
