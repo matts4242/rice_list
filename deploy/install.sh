@@ -81,7 +81,9 @@ Options:
                             the checkout so upgrades never touch it.
                             (default: /var/lib/ricelist)
   --site-name NAME          Name shown in the header and emails. (default: Rice List)
-  --firewall                Configure and enable ufw (SSH and web only). Off by
+  --firewall                Configure and enable ufw (SSH and web only). Opens
+                            every port sshd is really listening on first, and
+                            refuses to enable ufw if it cannot find one. Off by
                             default: enabling a firewall over SSH can lock you
                             out, so opt in deliberately.
   -h, --help                Show this help.
@@ -228,6 +230,64 @@ elif [ -t 0 ]; then
 else
   warn "No admin password given and no terminal to prompt on."
   warn "The moderation panel will stay disabled; re-run later to set one."
+fi
+
+# Every TCP port SSH can be reached on, asked three ways because each one
+# alone can miss the port you are connected through: sshd -T reports sshd's
+# own config, but on Ubuntu 24.04 systemd's ssh.socket owns the listener and
+# a port moved with a socket drop-in never shows up there; ss shows what is
+# really listening, but names systemd, not sshd, as the owner of an
+# activated socket; and ssh.socket's Listen= covers exactly that case.
+# Allowing a port nothing uses costs nothing; missing the real one locks the
+# operator out the moment this session drops.
+ssh_ports() {
+  local sshd_settings
+  {
+    if command -v sshd >/dev/null 2>&1; then
+      # sshd -T refuses to run without its privilege separation directory,
+      # which ssh.service creates -- on 24.04 only once someone has logged in
+      # over SSH since boot.
+      install -d -m 0755 /run/sshd
+      if sshd_settings="$(sshd -T 2>/dev/null)"; then
+        printf '%s\n' "$sshd_settings" | awk '
+          $1 == "port" { print $2 }
+          $1 == "listenaddress" { sub(/.*:/, "", $2); print $2 }'
+      else
+        warn "sshd -T could not read the SSH configuration; going by the listening sockets alone."
+      fi
+    fi
+    if command -v ss >/dev/null 2>&1; then
+      ss -Htlnp 2>/dev/null \
+        | awk '/users:\(\("sshd",/ { n = split($4, part, ":"); print part[n] }' || true
+    fi
+    if systemctl is-active --quiet ssh.socket 2>/dev/null \
+       || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+      systemctl show -p Listen --value ssh.socket 2>/dev/null \
+        | awk '{ n = split($1, part, ":"); print part[n] }' || true
+    fi
+  } | awk '/^[0-9]+$/ && $1 > 0 && $1 < 65536' | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+
+ufw_is_active() {
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'
+}
+
+# Worked out now, before anything is installed, so that a box we cannot read
+# stops here rather than half way through with the firewall still to do.
+SSH_PORTS=""
+if [ "$CONFIGURE_FIREWALL" = "yes" ]; then
+  SSH_PORTS="$(ssh_ports)"
+  if [ -n "$SSH_PORTS" ]; then
+    info "SSH is listening on: ${SSH_PORTS}"
+  elif ufw_is_active; then
+    warn "Could not tell which port SSH listens on; ufw is already active, so"
+    warn "only the web rules will be added and its SSH rules are left as they are."
+  else
+    die "--firewall: could not tell which port SSH is listening on, and enabling
+     ufw without allowing it would cut this session off for good. Allow your
+     SSH port and enable ufw by hand (ufw allow PORT/tcp && ufw enable) -- with
+     ufw already active this script only adds rules -- or drop --firewall."
+  fi
 fi
 
 ok "Preflight checks passed"
@@ -708,16 +768,31 @@ fi
 if [ "$CONFIGURE_FIREWALL" = "yes" ]; then
   step "Configuring the firewall"
   apt-get install -y -qq ufw >/dev/null
-  # SSH first, so enabling the firewall cannot cut off this session.
-  ufw allow OpenSSH >/dev/null
+  ufw_was_active="no"
+  if ufw_is_active; then ufw_was_active="yes"; fi
+  [ -n "$SSH_PORTS" ] || [ "$ufw_was_active" = "yes" ] \
+    || die "no SSH port known; refusing to enable ufw."
+
+  # SSH first, on every port it was found listening on. The OpenSSH profile
+  # is port 22 only, so on a box whose sshd uses another one it let the
+  # firewall cut off every new connection the moment this session ended.
+  for port in $SSH_PORTS; do
+    ufw allow "${port}/tcp" comment "SSH" >/dev/null
+  done
   ufw allow 'Nginx Full' >/dev/null
-  ufw --force enable >/dev/null
-  ok "ufw enabled, allowing SSH and web traffic"
+
+  if [ "$ufw_was_active" = "yes" ]; then
+    # Already enforcing the operator's own rules; adding ours is enough.
+    ok "ufw was already active; allowed SSH (${SSH_PORTS:-left as it was}) and web traffic"
+  else
+    ufw --force enable >/dev/null
+    ok "ufw enabled, allowing SSH on ${SSH_PORTS} and web traffic"
+  fi
 else
   step "Firewall left alone"
   info "Enabling a firewall over SSH can lock you out, so it is opt-in."
-  info "To do it later:"
-  info "  ufw allow OpenSSH && ufw allow 'Nginx Full' && ufw enable"
+  info "To do it later, re-run with --firewall: it allows every port sshd is"
+  info "really listening on before enabling ufw."
 fi
 
 # --- Verify -----------------------------------------------------------------
