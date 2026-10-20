@@ -6,8 +6,9 @@
 # Encrypt certificate, then starts the site and checks that it answers.
 #
 # Re-running is safe: it upgrades the checkout, reinstalls dependencies and
-# restarts the service, keeping the existing session secret, admin password
-# and database. That makes this the update script too.
+# restarts the service, keeping the existing session secret, admin password,
+# database and every .env setting it does not manage. That makes this the
+# update script too.
 #
 #   sudo ./deploy/install.sh --domain ads.example.com --email you@example.com
 #
@@ -27,6 +28,7 @@ PORT="3000"
 SITE_NAME="Rice List"
 NODE_MAJOR_MIN="20"     # package.json requires >= 20
 NODE_MAJOR_INSTALL="22" # what we pull from NodeSource if the distro is older
+BACKUP_DIR="/var/backups/ricelist"  # shared with deploy/redeploy.sh
 POLICY_RC_D="/usr/sbin/policy-rc.d"
 
 DOMAIN=""
@@ -34,6 +36,7 @@ LETSENCRYPT_EMAIL=""
 NO_TLS="no"
 CONFIGURE_FIREWALL="no"
 ADMIN_PASSWORD_FILE=""
+SITE_NAME_GIVEN="no"
 
 # --- Output helpers ---------------------------------------------------------
 
@@ -52,10 +55,15 @@ die()  { printf '\n%serror:%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; exit 1; }
 
 # Undo whatever this run put in place only for its own duration, however it
 # ends -- die, a failed command under set -e, or Ctrl-C. A policy-rc.d left
-# behind would stop later package upgrades from restarting nginx.
+# behind would stop later package upgrades from restarting nginx, and the
+# working copies of .env hold its secrets.
 POLICY_RC_D_OURS="no"
+ENV_WORK=""
+ENV_TMP=""
 cleanup() {
   if [ "$POLICY_RC_D_OURS" = "yes" ]; then rm -f "$POLICY_RC_D"; fi
+  if [ -n "$ENV_WORK" ]; then rm -rf "$ENV_WORK"; fi
+  if [ -n "$ENV_TMP" ]; then rm -f "$ENV_TMP"; fi
 }
 trap cleanup EXIT
 
@@ -80,7 +88,9 @@ Options:
   --data-dir PATH           Where the database and uploads live, kept outside
                             the checkout so upgrades never touch it.
                             (default: /var/lib/ricelist)
-  --site-name NAME          Name shown in the header and emails. (default: Rice List)
+  --site-name NAME          Name shown in the header and emails. No double
+                            quotes, backticks or backslashes. (default: Rice
+                            List, or on a re-run the name already in .env)
   --firewall                Configure and enable ufw (SSH and web only). Opens
                             every port sshd is really listening on first, and
                             refuses to enable ufw if it cannot find one. Off by
@@ -91,6 +101,10 @@ Options:
 The admin password can also come from the RICELIST_ADMIN_PASSWORD environment
 variable. There is deliberately no --admin-password flag, because command line
 arguments are visible to every user on the machine via ps.
+
+Re-running with the same options updates the site. Settings you added to the
+app's .env by hand -- SMTP, MAIL_FROM, limits -- are kept, and .env is backed
+up to /var/backups/ricelist before it is changed.
 
 A note on TLS. In production the session cookie is marked Secure, so a browser
 will not store it over plain HTTP. Without TLS somewhere in the chain the site
@@ -112,7 +126,7 @@ while [ $# -gt 0 ]; do
     --port)                PORT="${2:-}"; shift 2 ;;
     --app-dir)             APP_DIR="${2:-}"; shift 2 ;;
     --data-dir)            DATA_DIR="${2:-}"; shift 2 ;;
-    --site-name)           SITE_NAME="${2:-}"; shift 2 ;;
+    --site-name)           SITE_NAME="${2:-}"; SITE_NAME_GIVEN="yes"; shift 2 ;;
     --firewall)            CONFIGURE_FIREWALL="yes"; shift ;;
     -h|--help)             usage; exit 0 ;;
     *)                     usage >&2; die "unknown option: $1" ;;
@@ -152,6 +166,23 @@ if [ -n "$DOMAIN" ]; then
   case "$DOMAIN" in
     *[!a-zA-Z0-9.-]*|-*|.*|*.) die "--domain does not look like a hostname: $DOMAIN" ;;
   esac
+fi
+
+# Whether a site name can be written into .env, alone and inside MAIL_FROM,
+# and read back unchanged. dotenv has no escape for a quote inside a quoted
+# value -- it keeps the backslash -- and turns \n into a newline, so a name
+# holding a double quote or a backtick (the quote characters written here) or
+# a backslash cannot be written faithfully.
+site_name_writable() {
+  case "$1" in
+    *[\"\`\\]*|*[[:cntrl:]]*) return 1 ;;
+  esac
+}
+
+if [ "$SITE_NAME_GIVEN" = "yes" ]; then
+  [ -n "$SITE_NAME" ] || die "--site-name cannot be empty."
+  site_name_writable "$SITE_NAME" \
+    || die "--site-name cannot contain double quotes, backticks, backslashes or control characters."
 fi
 
 if [ -n "$ADMIN_PASSWORD_FILE" ] && [ ! -r "$ADMIN_PASSWORD_FILE" ]; then
@@ -208,6 +239,61 @@ ENV_FILE="$APP_DIR/.env"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 NGINX_SITE="/etc/nginx/sites-available/${SERVICE_NAME}"
 
+# Everything below reads, and edits, a private copy of .env; the real file is
+# replaced once, at the end. It lives in a directory the service account
+# owns, so it is read as that account and never edited in place: a symlink
+# planted there cannot get root to read, or write, anything else.
+if [ -L "$ENV_FILE" ] || { [ -e "$ENV_FILE" ] && [ ! -f "$ENV_FILE" ]; }; then
+  die "$ENV_FILE is not a regular file. Put the real settings file there and re-run."
+fi
+ENV_WORK="$(mktemp -d)"
+ENV_OLD="${ENV_WORK}/env.old"
+: > "$ENV_OLD"
+if [ -f "$ENV_FILE" ]; then
+  if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    # Read as the service, written as root into the private copy: on purpose.
+    # shellcheck disable=SC2024
+    sudo -u "$SERVICE_USER" cat "$ENV_FILE" > "$ENV_OLD" \
+      || die "$SERVICE_USER cannot read $ENV_FILE, so the site cannot either. Fix with:
+     chown ${SERVICE_USER}:${SERVICE_USER} ${ENV_FILE} && chmod 600 ${ENV_FILE}"
+  else
+    cat "$ENV_FILE" > "$ENV_OLD"
+  fi
+fi
+
+# Reading .env the way the app does. dotenv keeps the LAST value of a key that
+# appears twice, and hash-password.js prints a ready-made ADMIN_PASSWORD_HASH=
+# line, so appending it is the natural way to change the password. Taking the
+# first occurrence here would quietly bring the replaced -- perhaps leaked --
+# password back on the next re-run.
+
+# The text after KEY= on the last line that sets KEY ($1), exactly as written,
+# in the existing .env or in file $2.
+env_raw() {
+  local file="${2:-$ENV_OLD}"
+  [ -f "$file" ] || return 0
+  sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=[[:space:]]*//p" "$file" \
+    | tail -n 1 | tr -d '\r'
+}
+
+# The value dotenv loads for KEY: quotes, and a comment after the value,
+# stripped the way dotenv strips them. Values spanning several lines are not
+# handled; nothing here writes one.
+env_value() {
+  local raw q re
+  raw="$(env_raw "$@")"
+  for q in '"' "'" '`'; do
+    re="^${q}((\\\\${q}|[^${q}])*)${q}[[:space:]]*(#.*)?\$"
+    if [[ "$raw" =~ $re ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done
+  # Unquoted, dotenv ends the value at the first '#'.
+  raw="${raw%%#*}"
+  printf '%s' "${raw%"${raw##*[![:space:]]}"}"
+}
+
 # Collect the admin password before any long-running work, so an interactive
 # run does not sit waiting for input ten minutes in.
 ADMIN_PASSWORD=""
@@ -216,7 +302,7 @@ if [ -n "$ADMIN_PASSWORD_FILE" ]; then
   [ -n "$ADMIN_PASSWORD" ] || die "--admin-password-file is empty."
 elif [ -n "${RICELIST_ADMIN_PASSWORD:-}" ]; then
   ADMIN_PASSWORD="$RICELIST_ADMIN_PASSWORD"
-elif grep -qs '^ADMIN_PASSWORD_HASH=.\+' "$ENV_FILE"; then
+elif [ -n "$(env_value ADMIN_PASSWORD_HASH)" ]; then
   info "Keeping the moderation password already configured."
 elif [ -t 0 ]; then
   printf '    Moderation password (blank to leave the panel disabled): '
@@ -511,9 +597,10 @@ ok "Dependencies installed and verified"
 step "Writing configuration"
 
 # Reuse the existing session secret. Regenerating it would sign every visitor
-# out and invalidate the CSRF token in every open form.
-if [ -f "$ENV_FILE" ] && grep -q '^SESSION_SECRET=.\+' "$ENV_FILE"; then
-  SESSION_SECRET="$(sed -n 's/^SESSION_SECRET=//p' "$ENV_FILE" | head -n 1)"
+# out and invalidate the CSRF token in every open form. It is carried over as
+# written, so whatever quoting it has keeps meaning the same thing.
+if [ -n "$(env_value SESSION_SECRET)" ]; then
+  SESSION_SECRET="$(env_raw SESSION_SECRET)"
   info "Reusing the existing session secret"
 else
   SESSION_SECRET="$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
@@ -537,8 +624,8 @@ if [ -n "$ADMIN_PASSWORD" ]; then
   )"
   unset ADMIN_PASSWORD
   info "Moderation password set"
-elif [ -f "$ENV_FILE" ]; then
-  ADMIN_PASSWORD_HASH="$(sed -n 's/^ADMIN_PASSWORD_HASH=//p' "$ENV_FILE" | head -n 1)"
+else
+  ADMIN_PASSWORD_HASH="$(env_raw ADMIN_PASSWORD_HASH)"
 fi
 
 if [ "$NO_TLS" = "yes" ]; then
@@ -547,17 +634,76 @@ else
   SITE_URL="https://${DOMAIN}"
 fi
 
-# Uploads have to fit through nginx: the app accepts MAX_IMAGES_PER_LISTING
-# files of MAX_IMAGE_BYTES each, and nginx's 1 MB default would reject them
-# with a 413 long before the app saw them.
-MAX_IMAGE_BYTES=8388608
-MAX_IMAGES=6
-UPLOAD_LIMIT_MB=$(( (MAX_IMAGE_BYTES * MAX_IMAGES) / 1048576 + 8 ))
+# SITE_NAME is the operator's once written: --site-name changes it, and a
+# re-run without the option keeps whatever .env says.
+PREVIOUS_SITE_NAME="$(env_value SITE_NAME)"
+if [ "$SITE_NAME_GIVEN" = "no" ] && [ -n "$PREVIOUS_SITE_NAME" ]; then
+  SITE_NAME="$PREVIOUS_SITE_NAME"
+  # Earlier versions wrote it unquoted, and dotenv stops reading an unquoted
+  # value at '#'.
+  case "$(env_raw SITE_NAME)" in
+    [\"\'\`]*) ;;
+    *\#*)
+      warn "SITE_NAME in ${ENV_FILE} is not quoted, so the site reads it only up"
+      warn "to its '#', as \"${SITE_NAME}\". Re-run with --site-name to write it in full." ;;
+  esac
+fi
 
-umask 077
-cat > "$ENV_FILE" <<ENVFILE
+# The sender address derived from the site's name and domain, as the app
+# must read it. A name holding one of RFC 5322's specials -- ( ) < > [ ] : ;
+# @ , -- goes in quotes, or nodemailer takes part of it for a comment, a
+# group, or the address itself.
+case "$SITE_NAME" in
+  *[\]\[\(\)\<\>:\;@,]*) MAIL_FROM_DEFAULT="\"${SITE_NAME}\" <no-reply@${DOMAIN:-localhost}>" ;;
+  *)                     MAIL_FROM_DEFAULT="${SITE_NAME} <no-reply@${DOMAIN:-localhost}>" ;;
+esac
+
+# A value as .env has to spell it for dotenv to read it back unchanged. In
+# double quotes, so that a '#' does not end it: unquoted, "Bob's #1 Ads" was
+# read as "Bob's", and the MAIL_FROM built from it lost its address. Or, if
+# it holds a double quote itself, in backticks -- dotenv has no escape for a
+# quote inside quotes, but takes backticks as quotes too.
+# shellcheck disable=SC2016  # literal backticks: the quote characters
+dotenv_quote() {
+  case "$1" in
+    *\"*) printf '`%s`' "$1" ;;
+    *)    printf '"%s"' "$1" ;;
+  esac
+}
+
+# Set KEY ($2) to VALUE ($3, written as given) in file $1: on the first line
+# that sets it, with any later duplicates dropped -- so it is unambiguous
+# which one the app reads -- or appended if missing. Other lines are untouched.
+env_set() {
+  KEY="$2" LINE="$2=$3" awk '
+    $0 ~ "^[ \t]*(export[ \t]+)?" ENVIRON["KEY"] "[ \t]*=" {
+      if (!done) print ENVIRON["LINE"]
+      done = 1
+      next
+    }
+    { print }
+    END { if (!done) print ENVIRON["LINE"] }
+  ' "$1" > "$1.next"
+  mv -f "$1.next" "$1"
+}
+
+# .env is edited, not regenerated. It is where the operator puts SMTP
+# credentials and tuned limits, and the documented way to update is to re-run
+# this script: rewriting the whole file silently turned mail relay off and
+# reset every limit. Only the settings this script is responsible for are
+# touched, in the private copy.
+ENV_NEW="${ENV_WORK}/env.new"
+if [ -f "$ENV_FILE" ]; then
+  cat "$ENV_OLD" > "$ENV_NEW"
+  # Files written by earlier versions say every other setting is regenerated.
+  sed -i 's/^# SESSION_SECRET and ADMIN_PASSWORD_HASH; everything else is regenerated\.$/# SESSION_SECRET, ADMIN_PASSWORD_HASH and every setting it does not manage./' "$ENV_NEW"
+else
+  cat > "$ENV_NEW" <<ENVFILE
 # Written by deploy/install.sh. Re-running the installer preserves
-# SESSION_SECRET and ADMIN_PASSWORD_HASH; everything else is regenerated.
+# SESSION_SECRET, ADMIN_PASSWORD_HASH and every setting it does not manage.
+# It manages NODE_ENV, PORT, HOST, TRUST_PROXY, DATA_DIR and SITE_URL, and
+# SITE_NAME when given --site-name. MAIL_FROM follows the site's name until
+# you change it. Change anything else here freely.
 
 NODE_ENV=production
 PORT=${PORT}
@@ -568,7 +714,7 @@ PORT=${PORT}
 # which would let it walk straight through every rate limit.
 HOST=127.0.0.1
 
-SITE_NAME=${SITE_NAME}
+SITE_NAME=$(dotenv_quote "$SITE_NAME")
 SITE_URL=${SITE_URL}
 SESSION_SECRET=${SESSION_SECRET}
 
@@ -584,8 +730,8 @@ ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}
 
 LISTINGS_PER_PAGE=24
 LISTING_EXPIRY_DAYS=45
-MAX_IMAGES_PER_LISTING=${MAX_IMAGES}
-MAX_IMAGE_BYTES=${MAX_IMAGE_BYTES}
+MAX_IMAGES_PER_LISTING=6
+MAX_IMAGE_BYTES=8388608
 POSTS_PER_HOUR=5
 MESSAGES_PER_HOUR=10
 EDITS_PER_HOUR=30
@@ -598,26 +744,106 @@ SMTP_PORT=587
 SMTP_SECURE=false
 SMTP_USER=
 SMTP_PASS=
-MAIL_FROM=${SITE_NAME} <no-reply@${DOMAIN:-localhost}>
+MAIL_FROM=$(dotenv_quote "$MAIL_FROM_DEFAULT")
 ENVFILE
-umask 022
+fi
 
-chown "$SERVICE_USER:$SERVICE_USER" "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-ok "Wrote $ENV_FILE (owner $SERVICE_USER, mode 600)"
+env_set "$ENV_NEW" NODE_ENV production
+env_set "$ENV_NEW" PORT "$PORT"
+env_set "$ENV_NEW" HOST 127.0.0.1
+env_set "$ENV_NEW" TRUST_PROXY 1
+env_set "$ENV_NEW" DATA_DIR "$DATA_DIR"
+env_set "$ENV_NEW" SITE_URL "$SITE_URL"
+env_set "$ENV_NEW" SESSION_SECRET "$SESSION_SECRET"
+env_set "$ENV_NEW" ADMIN_PASSWORD_HASH "$ADMIN_PASSWORD_HASH"
+if [ "$SITE_NAME_GIVEN" = "yes" ] || [ -z "$PREVIOUS_SITE_NAME" ]; then
+  env_set "$ENV_NEW" SITE_NAME "$(dotenv_quote "$SITE_NAME")"
+fi
 
-if [ -z "$ADMIN_PASSWORD_HASH" ]; then
+# MAIL_FROM is the operator's to set -- it often has to match the SMTP
+# account -- so it is left alone unless it is still the one derived from the
+# site's name, which then follows --site-name, or cannot work: no address at
+# all, as when an unquoted '#' in the name cut it off.
+derived_from="${PREVIOUS_SITE_NAME:-Rice List}"
+case "$(env_value MAIL_FROM)" in
+  "$MAIL_FROM_DEFAULT")
+    mail_from="current" ;;
+  "${derived_from} <no-reply@${DOMAIN:-localhost}>"|"\"${derived_from}\" <no-reply@${DOMAIN:-localhost}>")
+    mail_from="derived" ;;
+  "")
+    mail_from="broken" ;;
+  *@*)
+    mail_from="operator's" ;;
+  *)
+    mail_from="broken" ;;
+esac
+if [ "$mail_from" = "derived" ] || [ "$mail_from" = "broken" ]; then
+  if site_name_writable "$SITE_NAME"; then
+    env_set "$ENV_NEW" MAIL_FROM "$(dotenv_quote "$MAIL_FROM_DEFAULT")"
+  elif [ "$mail_from" = "broken" ]; then
+    warn "MAIL_FROM cannot work as it is, and SITE_NAME cannot be written into a new"
+    warn "one; set MAIL_FROM in ${ENV_FILE} by hand before configuring SMTP."
+  fi
+fi
+
+# The new file goes in beside the old and is renamed over it, so the app never
+# reads half of one. install(1) unlinks whatever has that name and creates the
+# file afresh, already owned by the service and mode 600, so neither a symlink
+# in the service's directory nor a moment of default permissions can expose
+# or misdirect the secrets in it. The old file is kept in the backup directory.
+env_current() {
+  [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] \
+    && [ "$(stat -c '%U:%G %a' "$ENV_FILE")" = "${SERVICE_USER}:${SERVICE_USER} 600" ] \
+    && cmp -s "$ENV_NEW" "$ENV_FILE"
+}
+if env_current; then
+  ok "${ENV_FILE} already up to date"
+else
+  if [ -f "$ENV_FILE" ]; then
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$BACKUP_DIR"
+    env_backup="${BACKUP_DIR}/env-$(date +%Y%m%d-%H%M%S)"
+    install -T -o "$SERVICE_USER" -g "$SERVICE_USER" -m 600 "$ENV_OLD" "$env_backup"
+    info "Previous settings saved to ${env_backup}"
+  fi
+  ENV_TMP="${ENV_FILE}.new"
+  install -T -o "$SERVICE_USER" -g "$SERVICE_USER" -m 600 "$ENV_NEW" "$ENV_TMP"
+  mv -fT "$ENV_TMP" "$ENV_FILE"
+  ENV_TMP=""
+  ok "Wrote $ENV_FILE (owner $SERVICE_USER, mode 600)"
+fi
+
+ADMIN_ENABLED="no"
+if [ -n "$(env_value ADMIN_PASSWORD_HASH "$ENV_NEW")" ]; then
+  ADMIN_ENABLED="yes"
+else
   warn "No moderation password is set, so /admin/login is disabled."
   warn "Re-run this script to set one."
 fi
+
+# Uploads have to fit through nginx: the app accepts MAX_IMAGES_PER_LISTING
+# files of MAX_IMAGE_BYTES each, and nginx's 1 MB default would reject them
+# with a 413 long before the app saw them. Sized from what .env now says,
+# since those limits are the operator's to raise.
+MAX_IMAGE_BYTES="$(env_value MAX_IMAGE_BYTES "$ENV_NEW")"
+case "$MAX_IMAGE_BYTES" in ''|*[!0-9]*|????????????*) MAX_IMAGE_BYTES=8388608 ;; esac
+MAX_IMAGES="$(env_value MAX_IMAGES_PER_LISTING "$ENV_NEW")"
+case "$MAX_IMAGES" in ''|*[!0-9]*|?????*) MAX_IMAGES=6 ;; esac
+MAX_IMAGE_BYTES=$((10#$MAX_IMAGE_BYTES))
+MAX_IMAGES=$((10#$MAX_IMAGES))
+UPLOAD_LIMIT_MB=$(( (MAX_IMAGE_BYTES * MAX_IMAGES) / 1048576 + 8 ))
 
 # --- systemd ----------------------------------------------------------------
 
 step "Installing the systemd service"
 
+# In a unit file '%' starts a specifier and a trailing backslash continues the
+# line, so neither may reach Description= raw.
+UNIT_DESCRIPTION="$(printf '%s' "$SITE_NAME" | tr -d '\\[:cntrl:]')"
+UNIT_DESCRIPTION="${UNIT_DESCRIPTION//%/%%}"
+
 cat > "$UNIT_FILE" <<UNIT
 [Unit]
-Description=${SITE_NAME}
+Description=${UNIT_DESCRIPTION}
 Documentation=https://github.com/matts4242/rice_list
 After=network-online.target
 Wants=network-online.target
@@ -832,7 +1058,7 @@ cat <<SUMMARY
 ${C_GREEN}${C_BOLD}${SITE_NAME} is installed.${C_RESET}
 
   URL             ${SITE_URL}
-  Moderation      ${SITE_URL}/admin/login$([ -z "$ADMIN_PASSWORD_HASH" ] && printf '  (disabled: no password set)')
+  Moderation      ${SITE_URL}/admin/login$([ "$ADMIN_ENABLED" = "no" ] && printf '  (disabled: no password set)')
   Code            ${APP_DIR}
   Data            ${DATA_DIR}   ${C_BOLD}<- back this up${C_RESET}
   Config          ${ENV_FILE}
@@ -844,7 +1070,8 @@ Everyday commands:
   journalctl -u ${SERVICE_NAME} -f
 
 To update to the latest release, re-run this script with the same options.
-Your database, uploads, session secret and admin password are preserved.
+Your database, uploads, session secret, admin password and the settings you
+added to ${ENV_FILE} are preserved.
 
 To back up, stop the service and copy the data directory (it holds both the
 database and the uploaded images):
