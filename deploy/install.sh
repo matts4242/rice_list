@@ -328,7 +328,15 @@ else
   info "Cloning $REPO_URL ($BRANCH)"
   run_as_service git clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
 fi
-ok "Source at $(run_as_service git -C "$APP_DIR" rev-parse --short HEAD)"
+
+# Record the branch this install follows where deploy/redeploy.sh looks for
+# it. Once HEAD is detached -- deploying a tag does that, and so did every
+# redeploy before -- the checkout itself no longer says, and redeploy's guess
+# was the remote's default branch: a plain update shipped main to an install
+# of --branch stable. As the service user, like every git command here: git's
+# safe.directory check refuses root in a repository owned by somebody else.
+run_as_service git -C "$APP_DIR" config ricelist.branch "$BRANCH"
+ok "Source at $(run_as_service git -C "$APP_DIR" rev-parse --short HEAD), tracking ${BRANCH}"
 
 step "Installing dependencies"
 
