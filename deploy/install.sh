@@ -27,6 +27,7 @@ PORT="3000"
 SITE_NAME="Rice List"
 NODE_MAJOR_MIN="20"     # package.json requires >= 20
 NODE_MAJOR_INSTALL="22" # what we pull from NodeSource if the distro is older
+POLICY_RC_D="/usr/sbin/policy-rc.d"
 
 DOMAIN=""
 LETSENCRYPT_EMAIL=""
@@ -48,6 +49,15 @@ info() { printf '    %s\n' "$1"; }
 ok()   { printf '    %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
 warn() { printf '    %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$1" >&2; }
 die()  { printf '\n%serror:%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; exit 1; }
+
+# Undo whatever this run put in place only for its own duration, however it
+# ends -- die, a failed command under set -e, or Ctrl-C. A policy-rc.d left
+# behind would stop later package upgrades from restarting nginx.
+POLICY_RC_D_OURS="no"
+cleanup() {
+  if [ "$POLICY_RC_D_OURS" = "yes" ]; then rm -f "$POLICY_RC_D"; fi
+}
+trap cleanup EXIT
 
 usage() {
   cat <<'USAGE'
@@ -228,10 +238,58 @@ step "Installing system packages"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+
+# nginx's package starts nginx the moment it is configured, with its stock
+# default site -- which listens on [::]:80. On a kernel booted with
+# ipv6.disable=1 that start fails, so dpkg fails, apt fails, and nginx is left
+# half-configured: every later apt run, this script's re-runs included, fails
+# the same way before our own IPv6 handling is ever reached. On such a host,
+# hold nginx's start with a policy-rc.d for the length of the install, then
+# take the default site out and start nginx ourselves. The policy denies
+# nginx alone (invoke-rc.d passes "nginx", deb-systemd-invoke "nginx.service")
+# and allows everything else, and the EXIT trap removes it however the run
+# ends: left behind, it would stop later upgrades from restarting nginx.
+POLICY_RC_D_MARK="# Written by deploy/install.sh to hold nginx's first start."
+if grep -qsxF "$POLICY_RC_D_MARK" "$POLICY_RC_D"; then
+  rm -f "$POLICY_RC_D"  # left behind by a run that was killed outright
+fi
+HOLD_NGINX_START="no"
+# shellcheck disable=SC2016  # ${Status} is dpkg-query's field, not a variable
+if [ ! -f /proc/net/if_inet6 ] \
+   && [ "$(dpkg-query -W -f='${Status}' nginx 2>/dev/null || true)" != "install ok installed" ]; then
+  if [ -e "$POLICY_RC_D" ]; then
+    warn "No IPv6 on this host, and ${POLICY_RC_D} already exists, so this script"
+    warn "cannot hold nginx's first start. If installing nginx fails, take the"
+    warn "[::] listen out of /etc/nginx/sites-available/default, then re-run."
+  else
+    info "No IPv6 on this host; holding nginx's first start until its default site is out."
+    POLICY_RC_D_OURS="yes"
+    cat > "$POLICY_RC_D" <<POLICY
+#!/bin/sh
+${POLICY_RC_D_MARK}
+for arg in "\$@"; do
+  case "\$arg" in nginx|nginx.service) exit 101 ;; esac
+done
+exit 0
+POLICY
+    chmod 0755 "$POLICY_RC_D"
+    HOLD_NGINX_START="yes"
+  fi
+fi
+
 # build-essential and python3 are only needed if a native module (better-sqlite3,
 # sharp) has no prebuilt binary for this platform and has to compile.
 apt-get install -y -qq \
   ca-certificates curl git gnupg nginx build-essential python3 >/dev/null
+
+if [ "$HOLD_NGINX_START" = "yes" ]; then
+  rm -f "$POLICY_RC_D"
+  POLICY_RC_D_OURS="no"
+  # The packaged default site is what cannot start here; ours replaces it
+  # further down in any case.
+  rm -f /etc/nginx/sites-enabled/default
+  systemctl start nginx || die "nginx did not start; see: journalctl -u nginx"
+fi
 ok "Base packages installed"
 
 # --- Node -------------------------------------------------------------------
@@ -611,7 +669,9 @@ ln -sfn "$NGINX_SITE" "/etc/nginx/sites-enabled/${SERVICE_NAME}"
 rm -f /etc/nginx/sites-enabled/default
 
 nginx -t >/dev/null 2>&1 || { nginx -t; die "nginx rejected its configuration."; }
-systemctl reload nginx
+# reload-or-restart rather than reload: it also starts an nginx that is not
+# running, as after a package install whose start a policy-rc.d held back.
+systemctl reload-or-restart nginx
 ok "nginx serving ${SERVER_NAME} on port 80"
 
 # --- TLS --------------------------------------------------------------------
