@@ -37,6 +37,7 @@ NO_TLS="no"
 CONFIGURE_FIREWALL="no"
 ADMIN_PASSWORD_FILE=""
 SITE_NAME_GIVEN="no"
+SITE_URL_GIVEN=""
 TRUSTED_PROXIES=()
 
 # --- Output helpers ---------------------------------------------------------
@@ -73,8 +74,9 @@ usage() {
 Usage: sudo ./deploy/install.sh [options]
 
 Options:
-  --domain NAME             Domain the site will be served on. Required unless
-                            --no-tls is given. Must already point at this host.
+  --domain NAME             Public domain the site is served on. Required.
+                            Unless --no-tls is given it must already point at
+                            this host, so Let's Encrypt can issue a certificate.
   --email ADDRESS           Address for Let's Encrypt expiry notices.
   --no-tls                  Skip certbot and serve plain HTTP on port 80. Only
                             correct when something in front of this box (a load
@@ -87,6 +89,10 @@ Options:
                             ranges, so rate limits apply per visitor instead of
                             to everyone behind the proxy at once. Required with
                             --no-tls; 0.0.0.0/0 and ::/0 are refused.
+  --site-url URL            Public address for emailed and on-screen links; must
+                            be https://, since the manage link in them is the
+                            only key to an ad. (default: https://DOMAIN, or on a
+                            re-run the https address already in .env)
   --admin-password-file F   Read the moderation password from file F instead of
                             prompting. The file is not modified or deleted.
   --repo URL                Git repository to install from.
@@ -130,6 +136,7 @@ while [ $# -gt 0 ]; do
     --email)               LETSENCRYPT_EMAIL="${2:-}"; shift 2 ;;
     --no-tls)              NO_TLS="yes"; shift ;;
     --trusted-proxy)       TRUSTED_PROXIES+=("${2:-}"); shift 2 ;;
+    --site-url)            SITE_URL_GIVEN="${2:-}"; shift 2 ;;
     --admin-password-file) ADMIN_PASSWORD_FILE="${2:-}"; shift 2 ;;
     --repo)                REPO_URL="${2:-}"; shift 2 ;;
     --branch)              BRANCH="${2:-}"; shift 2 ;;
@@ -168,15 +175,14 @@ case "$PORT" in
   ''|*[!0-9]*) die "--port must be a number, got: $PORT" ;;
 esac
 
-if [ "$NO_TLS" = "no" ]; then
-  [ -n "$DOMAIN" ] || die "--domain is required (or pass --no-tls). See --help."
-fi
-
-if [ -n "$DOMAIN" ]; then
-  case "$DOMAIN" in
-    *[!a-zA-Z0-9.-]*|-*|.*|*.) die "--domain does not look like a hostname: $DOMAIN" ;;
-  esac
-fi
+# Required with --no-tls too. The domain is what SITE_URL and MAIL_FROM are
+# built from; without one they fell back to localhost, so every manage link
+# the site emailed or showed pointed nowhere.
+[ -n "$DOMAIN" ] || die "--domain is required: it is the public name of the site,
+     used for its links and its mail. See --help."
+case "$DOMAIN" in
+  *[!a-zA-Z0-9.-]*|-*|.*|*.) die "--domain does not look like a hostname: $DOMAIN" ;;
+esac
 
 # Whether a site name can be written into .env, alone and inside MAIL_FROM,
 # and read back unchanged. dotenv has no escape for a quote inside a quoted
@@ -193,6 +199,27 @@ if [ "$SITE_NAME_GIVEN" = "yes" ]; then
   [ -n "$SITE_NAME" ] || die "--site-name cannot be empty."
   site_name_writable "$SITE_NAME" \
     || die "--site-name cannot contain double quotes, backticks, backslashes or control characters."
+fi
+
+# Whether $1 will do as SITE_URL. The manage link in every email is the only
+# credential for an ad, so it must never be sent as http://. Behind --no-tls
+# the visitor still arrives over https -- the proxy in front terminates it --
+# so https is right there too. The character set keeps the value safe to
+# write into .env bare.
+site_url_ok() {
+  case "$1" in
+    https://[a-zA-Z0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!a-zA-Z0-9.:/_~%+-]*) return 1 ;;
+  esac
+}
+
+if [ -n "$SITE_URL_GIVEN" ]; then
+  SITE_URL_GIVEN="${SITE_URL_GIVEN%/}"
+  site_url_ok "$SITE_URL_GIVEN" \
+    || die "--site-url must be an https:// address made of letters, digits and .:/_~%+- only, got: $SITE_URL_GIVEN"
 fi
 
 # An address or CIDR range for set_real_ip_from. Checked here, before
@@ -713,10 +740,27 @@ else
   ADMIN_PASSWORD_HASH="$(env_raw ADMIN_PASSWORD_HASH)"
 fi
 
-if [ "$NO_TLS" = "yes" ]; then
-  SITE_URL="http://${DOMAIN:-localhost}"
+# Links in email and on screen are built from SITE_URL, and the manage link
+# among them is the only credential for an ad. An address given with
+# --site-url wins; otherwise keep the https address already configured, so a
+# re-run without the option does not quietly undo it; failing both, the
+# domain. Always https: with --no-tls, TLS is terminated in front of us.
+existing_site_url="$(env_value SITE_URL)"
+existing_site_url="${existing_site_url%/}"
+if [ -n "$SITE_URL_GIVEN" ]; then
+  SITE_URL="$SITE_URL_GIVEN"
+elif site_url_ok "$existing_site_url"; then
+  SITE_URL="$existing_site_url"
+  site_host="${SITE_URL#https://}"; site_host="${site_host%%/*}"; site_host="${site_host%%:*}"
+  if [ "${site_host,,}" != "${DOMAIN,,}" ]; then
+    warn "Keeping SITE_URL=${SITE_URL} from ${ENV_FILE}, which is not on ${DOMAIN}."
+    warn "Pass --site-url https://${DOMAIN} if links should point there instead."
+  fi
 else
   SITE_URL="https://${DOMAIN}"
+  if [ -n "$existing_site_url" ]; then
+    info "SITE_URL was ${existing_site_url}; links now use ${SITE_URL}"
+  fi
 fi
 
 # SITE_NAME is the operator's once written: --site-name changes it, and a
@@ -739,8 +783,8 @@ fi
 # @ , -- goes in quotes, or nodemailer takes part of it for a comment, a
 # group, or the address itself.
 case "$SITE_NAME" in
-  *[\]\[\(\)\<\>:\;@,]*) MAIL_FROM_DEFAULT="\"${SITE_NAME}\" <no-reply@${DOMAIN:-localhost}>" ;;
-  *)                     MAIL_FROM_DEFAULT="${SITE_NAME} <no-reply@${DOMAIN:-localhost}>" ;;
+  *[\]\[\(\)\<\>:\;@,]*) MAIL_FROM_DEFAULT="\"${SITE_NAME}\" <no-reply@${DOMAIN}>" ;;
+  *)                     MAIL_FROM_DEFAULT="${SITE_NAME} <no-reply@${DOMAIN}>" ;;
 esac
 
 # A value as .env has to spell it for dotenv to read it back unchanged. In
@@ -850,14 +894,15 @@ fi
 # MAIL_FROM is the operator's to set -- it often has to match the SMTP
 # account -- so it is left alone unless it is still the one derived from the
 # site's name, which then follows --site-name, or cannot work: no address at
-# all, as when an unquoted '#' in the name cut it off.
+# all (an unquoted '#' in the name cut it off), or no-reply@localhost from an
+# install that had no domain.
 derived_from="${PREVIOUS_SITE_NAME:-Rice List}"
 case "$(env_value MAIL_FROM)" in
   "$MAIL_FROM_DEFAULT")
     mail_from="current" ;;
-  "${derived_from} <no-reply@${DOMAIN:-localhost}>"|"\"${derived_from}\" <no-reply@${DOMAIN:-localhost}>")
+  "${derived_from} <no-reply@${DOMAIN}>"|"\"${derived_from}\" <no-reply@${DOMAIN}>")
     mail_from="derived" ;;
-  "")
+  ""|*@localhost|*@localhost\>)
     mail_from="broken" ;;
   *@*)
     mail_from="operator's" ;;
@@ -982,7 +1027,7 @@ ok "Service ${SERVICE_NAME} enabled and started"
 
 step "Configuring nginx"
 
-SERVER_NAME="${DOMAIN:-_}"
+SERVER_NAME="$DOMAIN"
 
 # In no-TLS mode an upstream proxy may already have terminated TLS, so pass its
 # X-Forwarded-Proto through when present and fall back to our own scheme. With
@@ -1056,7 +1101,7 @@ NGINX
 
 ln -sfn "$NGINX_SITE" "/etc/nginx/sites-enabled/${SERVICE_NAME}"
 # Ubuntu's packaged default site answers on port 80 for every hostname and
-# would otherwise shadow ours when no domain is set.
+# would otherwise shadow ours for requests that do not name the domain.
 rm -f /etc/nginx/sites-enabled/default
 
 nginx -t >/dev/null 2>&1 || { nginx -t; die "nginx rejected its configuration."; }
@@ -1147,7 +1192,7 @@ if [ "$health_ok" != "yes" ]; then
 fi
 ok "Application responding on port ${PORT}"
 
-if [ -n "$DOMAIN" ] && [ "$NO_TLS" = "no" ]; then
+if [ "$NO_TLS" = "no" ]; then
   if curl -fsS --max-time 10 "https://${DOMAIN}/health" >/dev/null 2>&1; then
     ok "https://${DOMAIN} reachable"
   else
