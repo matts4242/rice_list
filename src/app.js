@@ -77,6 +77,26 @@ function createApp() {
     })
   );
 
+  // Behind a proxy with TRUST_PROXY off, every visitor looks like the proxy:
+  // all of them share one rate-limit bucket and count as a single reporter,
+  // so auto-hide can never trigger. express-rate-limit's default key
+  // generator warned about this, but ours (see client-key.js) replaces it,
+  // so say it here, once.
+  if (!config.trustProxy) {
+    let warned = false;
+    app.use((req, res, next) => {
+      if (!warned && req.get('x-forwarded-for')) {
+        warned = true;
+        console.warn(
+          'Requests are arriving with X-Forwarded-For but TRUST_PROXY is off, so every ' +
+            'visitor looks like the proxy: rate limits and report counting treat them ' +
+            'all as one client. Set TRUST_PROXY=1 if this app is behind a reverse proxy.'
+        );
+      }
+      next();
+    });
+  }
+
   app.use(express.urlencoded({ extended: false, limit: '256kb' }));
   app.use('/static', express.static(path.join(__dirname, '..', 'public'), {
     maxAge: config.isProduction ? '7d' : 0,

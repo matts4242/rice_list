@@ -506,6 +506,20 @@ test('outside production the CSP does not force every request onto HTTPS', async
   assert.doesNotMatch(csp, /upgrade-insecure-requests/);
 });
 
+test('a proxy in front with TRUST_PROXY off is reported, once', async (t) => {
+  // Regression: the custom rate-limit key replaced express-rate-limit's own,
+  // and with it the library's warning about exactly this setup, in which
+  // every visitor shares one bucket and auto-hide can never trigger.
+  const warnings = [];
+  t.mock.method(console, 'warn', (message) => warnings.push(message));
+
+  await request(app).get('/').set('X-Forwarded-For', '203.0.113.9');
+  await request(app).get('/').set('X-Forwarded-For', '203.0.113.10');
+
+  const relevant = warnings.filter((message) => /TRUST_PROXY is off/.test(message));
+  assert.equal(relevant.length, 1);
+});
+
 // ---------------------------------------------------------------------------
 // Bind address: the app must be able to hide behind the proxy.
 // ---------------------------------------------------------------------------
