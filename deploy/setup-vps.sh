@@ -635,6 +635,19 @@ SSHD
       die "sshd rejected the hardening config; removed it and changed nothing."
     fi
     SSHD_CONFIG="$(sshd -T)" || die "sshd -T failed after writing the hardening config."
+    # When root's key is the way in, root must still be allowed to use it. An
+    # earlier file saying "PermitRootLogin no" wins over our prohibit-password,
+    # and with passwords off that would leave nobody able to log in. The
+    # drop-ins are removed again, not left for the next connection to load.
+    if [ "$key_user" = "root" ]; then
+      case "$(awk '$1 == "permitrootlogin" { print $2; exit }' <<<"$SSHD_CONFIG")" in
+        no|forced-commands-only)
+          rm -f "$SSHD_FIRST" "$SSHD_LAST"
+          die "root is the account with the key, but sshd does not allow root to log in
+     (PermitRootLogin is set earlier in the config). Disabling passwords now would
+     lock everybody out, so nothing was changed. Re-run with --admin-user NAME." ;;
+      esac
+    fi
     require_sshd passwordauthentication no
     require_sshd kbdinteractiveauthentication no
     if [ "$root_login" = "no" ]; then require_sshd permitrootlogin no; fi
