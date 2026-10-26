@@ -41,7 +41,7 @@ function applyFallbackLocals(res) {
   if (!locals.flagReasons) locals.flagReasons = flagsModel.REASONS;
   if (locals.isAdmin === undefined) locals.isAdmin = false;
   if (locals.flash === undefined) locals.flash = null;
-  if (!locals.csrfToken) locals.csrfToken = '';
+  if (!locals.csrfToken) locals.csrfToken = () => '';
   if (!locals.format) locals.format = format;
 }
 
@@ -64,6 +64,11 @@ function createApp() {
           formAction: ["'self'"],
           frameAncestors: ["'none'"],
           objectSrc: ["'none'"],
+          // Production is HTTPS-only, so this costs nothing there. In
+          // development it rewrote every subresource and form to https://,
+          // breaking the site when opened over plain HTTP by LAN address.
+          // helmet drops a default directive set to null, not to [].
+          upgradeInsecureRequests: config.isProduction ? [] : null,
         },
       },
       // Uploaded images are served same-origin; the default COEP breaks
@@ -71,6 +76,26 @@ function createApp() {
       crossOriginEmbedderPolicy: false,
     })
   );
+
+  // Behind a proxy with TRUST_PROXY off, every visitor looks like the proxy:
+  // all of them share one rate-limit bucket and count as a single reporter,
+  // so auto-hide can never trigger. express-rate-limit's default key
+  // generator warned about this, but ours (see client-key.js) replaces it,
+  // so say it here, once.
+  if (!config.trustProxy) {
+    let warned = false;
+    app.use((req, res, next) => {
+      if (!warned && req.get('x-forwarded-for')) {
+        warned = true;
+        console.warn(
+          'Requests are arriving with X-Forwarded-For but TRUST_PROXY is off, so every ' +
+            'visitor looks like the proxy: rate limits and report counting treat them ' +
+            'all as one client. Set TRUST_PROXY=1 if this app is behind a reverse proxy.'
+        );
+      }
+      next();
+    });
+  }
 
   app.use(express.urlencoded({ extended: false, limit: '256kb' }));
   app.use('/static', express.static(path.join(__dirname, '..', 'public'), {
@@ -85,6 +110,11 @@ function createApp() {
     },
   }));
 
+  // Ahead of the session and the per-request locals: uptime monitors and
+  // redeploy.sh poll this constantly, and it needs neither a session nor the
+  // category query.
+  app.get('/health', (req, res) => res.json({ ok: true }));
+
   app.use(
     session({
       store: new SqliteStore({
@@ -93,7 +123,9 @@ function createApp() {
       }),
       secret: config.sessionSecret,
       resave: false,
-      saveUninitialized: true,
+      // A session is stored only once something is put in it: a CSRF token
+      // for a rendered form, a flash message, an admin sign-in.
+      saveUninitialized: false,
       name: 'ricelist.sid',
       cookie: {
         httpOnly: true,
@@ -128,8 +160,6 @@ function createApp() {
   app.use('/', require('./routes/listings'));
   app.use('/', require('./routes/messages'));
   app.use('/admin', require('./routes/admin'));
-
-  app.get('/health', (req, res) => res.json({ ok: true }));
 
   app.use((req, res) => {
     applyFallbackLocals(res);

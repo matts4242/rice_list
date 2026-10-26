@@ -1,10 +1,13 @@
 'use strict';
 
 const { getDb } = require('../db');
+const { EFFECTIVE_STATUS } = require('./listings');
 
+// Status is the effective one, as on the public site: a listing that has
+// lapsed but not been swept yet is expired here too, not "active".
 const ADMIN_COLUMNS = `
   l.id, l.public_id, l.title, l.price_cents, l.location, l.contact_email,
-  l.status, l.removed_reason, l.flag_count, l.view_count, l.created_at,
+  ${EFFECTIVE_STATUS} AS status, l.removed_reason, l.flag_count, l.view_count, l.created_at,
   l.updated_at, l.expires_at, c.name AS category_name, c.slug AS category_slug,
   (SELECT count(*) FROM flags f WHERE f.listing_id = l.id AND f.resolved = 0)
     AS open_flags,
@@ -24,8 +27,11 @@ const FILTERS = {
   all: { label: 'All', where: '1 = 1', order: 'l.created_at DESC' },
 };
 
-function listFor(filterKey, { page = 1, perPage = 30, search = '' } = {}) {
-  const filter = FILTERS[filterKey] || FILTERS.flagged;
+function listFor(requestedKey, { page = 1, perPage = 30, search = '' } = {}) {
+  // hasOwn, not a truthiness test: "constructor" or "__proto__" from the query
+  // string would otherwise resolve to Object.prototype members.
+  const filterKey = Object.hasOwn(FILTERS, requestedKey) ? requestedKey : 'flagged';
+  const filter = FILTERS[filterKey];
   const conditions = [filter.where];
   const params = {};
 
@@ -63,7 +69,7 @@ function listFor(filterKey, { page = 1, perPage = 30, search = '' } = {}) {
     )
     .all({ ...params, limit: perPage, offset: (currentPage - 1) * perPage });
 
-  return { rows, total, page: currentPage, pageCount, filterKey: FILTERS[filterKey] ? filterKey : 'flagged' };
+  return { rows, total, page: currentPage, pageCount, filterKey };
 }
 
 function stats() {
@@ -75,7 +81,7 @@ function stats() {
          count(*) FILTER (WHERE status = 'removed') AS removed,
          count(*) FILTER (WHERE status = 'expired') AS expired,
          count(*)                                   AS total
-       FROM listings`
+       FROM (SELECT ${EFFECTIVE_STATUS} AS status FROM listings l)`
     )
     .get();
   const openFlags = db

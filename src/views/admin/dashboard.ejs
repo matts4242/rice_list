@@ -68,12 +68,12 @@
               <td class="table-actions">
                 <% if (row.status === 'active') { %>
                   <form method="post" action="/admin/listing/<%= row.public_id %>/remove" class="inline-form">
-                    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                    <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
                     <button class="btn btn-small btn-danger" type="submit">Remove</button>
                   </form>
                 <% } else { %>
                   <form method="post" action="/admin/listing/<%= row.public_id %>/restore" class="inline-form">
-                    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                    <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
                     <button class="btn btn-small btn-ghost" type="submit">Restore</button>
                   </form>
                 <% } %>

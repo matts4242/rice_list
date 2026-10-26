@@ -12,7 +12,7 @@
   <% } %>
 
   <form method="post" action="/post" enctype="multipart/form-data" class="stack" novalidate>
-    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+    <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
 
     <%- include('partials/listing-form', { values: values, errors: errors, categories: categories, limits: limits }) %>
 

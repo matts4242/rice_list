@@ -54,15 +54,33 @@ function attachImages(listings) {
   return listings;
 }
 
+// The work one search may ask of FTS. Every term is ANDed in and costs a pass
+// over its matches, so an unbounded query — "a a a …" eight thousand times —
+// stalls the process for seconds. Past a few terms results only narrow.
+const MAX_SEARCH_LENGTH = 200;
+const MAX_SEARCH_TERMS = 8;
+
 /**
  * FTS5 treats plenty of punctuation as syntax. Users type search boxes, not
  * query languages, so quote each term and prefix-match the last one.
+ *
+ * Case is left to the unicode61 tokenizer, which folds it the same way for
+ * the index and the query; lowercasing here instead turned "İstanbul" into
+ * "i̇stanbul", whose combining dot then split the word. Combining marks stay
+ * inside terms, and input is NFC-normalised, so decomposed accents match too.
  */
 function toFtsQuery(search) {
-  const terms = String(search)
-    .toLowerCase()
-    .split(/[^\p{L}\p{N}]+/u)
-    .filter(Boolean);
+  const terms = [
+    ...new Set(
+      String(search)
+        .slice(0, MAX_SEARCH_LENGTH)
+        .normalize('NFC')
+        .split(/[^\p{L}\p{M}\p{N}]+/u)
+        // A term that is only stray combining marks would match nothing and,
+        // ANDed in, empty the whole result.
+        .filter((term) => /[\p{L}\p{N}]/u.test(term))
+    ),
+  ].slice(0, MAX_SEARCH_TERMS);
   if (terms.length === 0) return null;
   return terms.map((term, i) => {
     const quoted = `"${term.replace(/"/g, '')}"`;
@@ -214,11 +232,23 @@ function create(values, imageFilenames = []) {
   return { listing: byPublicId(publicId), manageToken };
 }
 
-function update(listingId, values) {
+/**
+ * Save an edit. With `imageFilenames`, the listing's images are replaced in
+ * the same transaction, so text and photos change together or not at all.
+ */
+function update(listingId, values, imageFilenames = null) {
   const category = categoryBySlug(values.category);
   if (!category) throw new Error(`Unknown category: ${values.category}`);
 
-  getDb()
+  const db = getDb();
+  db.transaction(() => {
+    updateText(db, listingId, category, values);
+    if (imageFilenames) replaceImages(listingId, imageFilenames);
+  })();
+}
+
+function updateText(db, listingId, category, values) {
+  db
     .prepare(
       `UPDATE listings
           SET title = @title, description = @description, price_cents = @priceCents,
@@ -250,14 +280,39 @@ function setStatus(listingId, status, reason = '') {
     .run(status, reason, listingId);
 }
 
+/**
+ * Extend a listing for another period. Only the stored status gates this:
+ * 'active' covers both a live ad and one that has lapsed but not yet been
+ * swept. A removed ad — by a moderator, or auto-hidden by reports — is not
+ * the owner's to bring back, so it is left alone and false is returned.
+ */
 function renew(listingId) {
-  getDb()
+  const { changes } = getDb()
     .prepare(
       `UPDATE listings
           SET status = 'active', expires_at = datetime('now', ?), updated_at = datetime('now')
-        WHERE id = ?`
+        WHERE id = ? AND status IN ('active', 'expired')`
     )
     .run(`+${config.listings.expiryDays} days`, listingId);
+  return changes > 0;
+}
+
+/**
+ * A moderator's restore. A listing that lapsed while it was removed, or was
+ * already expired, gets a fresh period: otherwise "restored" would leave it
+ * just as unavailable as before.
+ */
+function restore(listingId) {
+  getDb()
+    .prepare(
+      `UPDATE listings
+          SET status = 'active', removed_reason = '',
+              expires_at = CASE WHEN expires_at <= datetime('now')
+                                THEN datetime('now', @expiry) ELSE expires_at END,
+              updated_at = datetime('now')
+        WHERE id = @id`
+    )
+    .run({ id: listingId, expiry: `+${config.listings.expiryDays} days` });
 }
 
 function remove(listingId) {
@@ -306,9 +361,12 @@ module.exports = {
   update,
   setStatus,
   renew,
+  restore,
   remove,
   authenticateManageToken,
   replaceImages,
   imagesFor,
   toFtsQuery,
+  EFFECTIVE_STATUS,
+  MAX_SEARCH_LENGTH,
 };

@@ -62,7 +62,7 @@
       </p>
 
       <form method="post" action="/listing/<%= listing.public_id %>/contact" class="stack">
-        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
 
         <div class="field">
           <label for="sender_name">Your name</label>

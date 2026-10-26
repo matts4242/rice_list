@@ -9,7 +9,7 @@
       <% if (isAdmin) { %>
         <a href="/admin">Moderation</a>
         <form method="post" action="/admin/logout" class="inline-form">
-          <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+          <input type="hidden" name="_csrf" value="<%= csrfToken() %>">
           <button type="submit" class="linklike">Sign out</button>
         </form>
       <% } else { %>
@@ -18,5 +18,6 @@
     </nav>
   </div>
 </footer>
+<script src="/static/js/confirm.js" defer></script>
 </body>
 </html>

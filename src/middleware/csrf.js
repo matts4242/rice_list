@@ -48,8 +48,25 @@ function reject(next) {
 }
 
 /**
+ * The session's token, created the first time a form asks for one. Reads
+ * req.session at call time, since logging in regenerates it.
+ */
+function sessionToken(req) {
+  if (!req.session) return '';
+  if (!req.session.csrfToken) {
+    req.session.csrfToken = crypto.randomBytes(32).toString('hex');
+  }
+  return req.session.csrfToken;
+}
+
+/**
  * Per-session CSRF token, checked on every state-changing request.
  * Kept in-house rather than pulling in a deprecated csurf-style dependency.
+ *
+ * Templates call csrfToken() rather than reading a value, so the token is only
+ * minted when a page actually renders a form. Writing it on every request
+ * would modify every session, and a modified session is a saved one: each
+ * crawler hit would leave a row in the session store.
  *
  * Multipart bodies are not parsed yet at this point in the chain — multer
  * runs inside the route — so those requests are marked deferred and verified
@@ -57,10 +74,7 @@ function reject(next) {
  * see MULTIPART_ROUTES.
  */
 function csrf(req, res, next) {
-  if (!req.session.csrfToken) {
-    req.session.csrfToken = crypto.randomBytes(32).toString('hex');
-  }
-  res.locals.csrfToken = req.session.csrfToken;
+  res.locals.csrfToken = () => sessionToken(req);
 
   if (SAFE_METHODS.has(req.method)) {
     next();
